@@ -4,7 +4,6 @@ import {
   forceKillProcess,
   hideDashboard,
   quitProcess,
-  setDemoMode,
   setKeepAwake,
   toggleKeepAwake,
 } from "./api";
@@ -265,16 +264,6 @@ export function App() {
     [showToast],
   );
 
-  const handleToggleDemo = useCallback(async () => {
-    if (!snap) return;
-    const next = await setDemoMode(!snap.demoMode);
-    setPowerSeries([]);
-    setCpuSeries([]);
-    setMemSeries([]);
-    showToast(next ? "demo mode ON" : "live macOS telemetry ON");
-    refresh(true);
-  }, [snap, refresh, showToast]);
-
   // Keyboard shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -314,10 +303,6 @@ export function App() {
       if (e.key === "c") {
         e.preventDefault();
         return void handleToggleAwake();
-      }
-      if (e.key === "d") {
-        e.preventDefault();
-        return void handleToggleDemo();
       }
       if (e.key === "/") {
         e.preventDefault();
@@ -383,7 +368,6 @@ export function App() {
     selectedIdx,
     snap,
     handleToggleAwake,
-    handleToggleDemo,
     handleQuit,
     handleKill,
     handleCopyFix,
@@ -615,13 +599,6 @@ export function App() {
         </div>
 
         <div className="tb-right">
-          <button
-            className={`mode-btn ${snap.demoMode ? "demo-on" : ""}`}
-            onClick={handleToggleDemo}
-            title="Switch between Live macOS telemetry and Demo mode (d)"
-          >
-            {snap.demoMode ? "demo" : "live"}
-          </button>
           <div className={`awake-ctrl ${keepAwake.active ? "on" : ""}`}>
             <button
               className="awake-btn"

@@ -164,29 +164,6 @@ body,
   gap: 8px;
 }
 
-.mode-btn {
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--muted);
-  font-family: inherit;
-  font-size: 10.5px;
-  padding: 3px 8px;
-  border-radius: 999px;
-  cursor: pointer;
-  transition: all 140ms ease;
-}
-
-.mode-btn:hover {
-  color: #ffffff;
-  border-color: rgba(255, 255, 255, 0.22);
-}
-
-.mode-btn.demo-on {
-  color: var(--sky);
-  border-color: rgba(56, 189, 248, 0.38);
-  background: rgba(56, 189, 248, 0.08);
-}
-
 /* Keep-Awake Split Control with Breathing Amber Halo */
 .awake-ctrl {
   display: inline-flex;

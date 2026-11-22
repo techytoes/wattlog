@@ -273,11 +273,9 @@ pub fn run_gui(demo_mode: bool) {
             let open_item = MenuItem::with_id(app, "open", "Open Wattlog", true, None::<&str>)?;
             let awake_item =
                 MenuItem::with_id(app, "toggle_awake", "Toggle Keep-Awake", true, None::<&str>)?;
-            let demo_item =
-                MenuItem::with_id(app, "toggle_demo", "Toggle Demo Mode", true, None::<&str>)?;
             let sep = PredefinedMenuItem::separator(app)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit Wattlog", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open_item, &awake_item, &demo_item, &sep, &quit_item])?;
+            let menu = Menu::with_items(app, &[&open_item, &awake_item, &sep, &quit_item])?;
 
             let tray_bytes = include_bytes!("../icons/tray-template@2x.png");
             let tray_icon = Image::from_bytes(tray_bytes)?;
@@ -299,14 +297,6 @@ pub fn run_gui(demo_mode: bool) {
                         if let Ok(ka) = st.engine.keep_awake.toggle_quick(&power) {
                             update_tray_title(app, power.system_watts, ka.active);
                         }
-                    }
-                    "toggle_demo" => {
-                        let st = app.state::<AppState>();
-                        let next = !st.engine.is_demo();
-                        st.engine.set_demo(next);
-                        let power = st.engine.read_power_fast();
-                        let ka = st.engine.keep_awake.state();
-                        update_tray_title(app, power.system_watts, ka.active);
                     }
                     "quit" => {
                         let st = app.state::<AppState>();
