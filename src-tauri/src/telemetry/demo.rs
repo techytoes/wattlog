@@ -5,9 +5,9 @@ pub fn demo_snapshot() -> DashboardSnapshot {
     let now_ms = chrono::Utc::now().timestamp_millis();
 
     let power = PowerSnapshot {
-        system_watts: 8.4,
+        system_watts: Some(8.4),
         battery_watts: -8.4,
-        source_tier: "AppleSmartBattery + macmon (demo)".into(),
+        source_tier: "AppleSMC (PSTR) + macmon (demo)".into(),
         state: PowerState::Discharging,
         battery: Some(BatteryInfo {
             charge_pct: 74,
@@ -57,11 +57,19 @@ pub fn demo_snapshot() -> DashboardSnapshot {
     let usbc = decode_wake_reason("EC.USBC PD renegotiation");
     let lid = decode_wake_reason("lid UserActivity");
 
+    let unplug_ts_ms = now_ms - 77_200 * 1000;
+    let sess1_start = now_ms - 59_000 * 1000;
+    let sess1_end = sess1_start + 30_240 * 1000;
+    let sess2_start = now_ms - 95_000 * 1000;
+    let sess2_end = sess2_start + 5_700 * 1000;
+
     let sessions = vec![
         SleepSession {
             id: "demo-sleep-1".into(),
             start_time: "Nov 21 23:18".into(),
             end_time: "Nov 22 07:42".into(),
+            start_ms: sess1_start,
+            end_ms: sess1_end,
             duration_secs: 30_240,
             start_charge_pct: Some(88),
             end_charge_pct: Some(71),
@@ -110,11 +118,14 @@ pub fn demo_snapshot() -> DashboardSnapshot {
                 },
             ],
             severity: "critical".into(),
+            in_current_unplug: true,
         },
         SleepSession {
             id: "demo-sleep-2".into(),
             start_time: "Nov 21 14:10".into(),
             end_time: "Nov 21 15:45".into(),
+            start_ms: sess2_start,
+            end_ms: sess2_end,
             duration_secs: 5_700,
             start_charge_pct: Some(96),
             end_charge_pct: Some(95),
@@ -134,6 +145,7 @@ pub fn demo_snapshot() -> DashboardSnapshot {
                 decoded: usbc.clone(),
             }],
             severity: "ok".into(),
+            in_current_unplug: false,
         },
     ];
 
@@ -148,9 +160,9 @@ pub fn demo_snapshot() -> DashboardSnapshot {
                 ("active", 9.6, 98 - ((i - 6) as u8), "Active coding session")
             } else if i < 34 {
                 if i % 4 == 0 {
-                    ("darkwake", 3.4, 88 - (((i - 14) * 17) / 20) as u8, "3 DarkWakes · wifibt")
+                    ("darkwake", 3.4, 88 - (((i - 14) * 17) / 20) as u8, "3 silent wakes · Wi-Fi / Bluetooth")
                 } else {
-                    ("sleep", 0.3, 88 - (((i - 14) * 17) / 20) as u8, "Deep Idle sleep")
+                    ("sleep", 0.3, 88 - (((i - 14) * 17) / 20) as u8, "Asleep (Deep Idle)")
                 }
             } else if i < 39 {
                 ("blocked", 11.2, 77 - ((i - 34) as u8), "Sleep blocked by Chrome WebRTC")
@@ -168,17 +180,37 @@ pub fn demo_snapshot() -> DashboardSnapshot {
         })
         .collect();
 
+    let unplug_reasons = vec![
+        WakeReasonAggregate {
+            decoded: wifibt.clone(),
+            count: 19,
+            total_secs: 304,
+        },
+        WakeReasonAggregate {
+            decoded: rtc.clone(),
+            count: 7,
+            total_secs: 114,
+        },
+    ];
+
     let sleep = SleepReport {
         since_unplug: SinceUnplugSummary {
             started_at: Some("Nov 21 18:10".into()),
+            unplug_ts_ms: Some(unplug_ts_ms),
+            unplug_source: "samples".into(),
+            data_status: "ok".into(),
+            history_coverage_secs: 86_400,
             elapsed_secs: 77_200,
             start_charge_pct: Some(98),
             current_charge_pct: Some(74),
             total_drop_pct: 24,
-            active_secs: 28_400,
-            sleep_secs: 48_354,
-            dark_wake_secs: 446,
-            dark_wake_count: 28,
+            asleep_drain_pct: 17,
+            active_drain_pct: 7,
+            sleep_session_count: 1,
+            active_secs: 46_542,
+            sleep_secs: 30_240,
+            dark_wake_secs: 418,
+            dark_wake_count: 26,
             drain_pct_per_hour: 1.1,
             on_battery_now: true,
         },
@@ -200,6 +232,7 @@ pub fn demo_snapshot() -> DashboardSnapshot {
                 total_secs: 28,
             },
         ],
+        since_unplug_wake_reasons: unplug_reasons,
         timeline,
         raw_log_available: true,
     };
@@ -207,6 +240,7 @@ pub fn demo_snapshot() -> DashboardSnapshot {
     let blockers = vec![
         SleepBlocker {
             pid: 48210,
+            start_time_secs: 1_700_000_001,
             process_name: "Google Chrome Helper (Renderer)".into(),
             app_name: "Google Chrome".into(),
             bundle_path: Some("/Applications/Google Chrome.app".into()),
@@ -222,6 +256,7 @@ pub fn demo_snapshot() -> DashboardSnapshot {
         },
         SleepBlocker {
             pid: 51904,
+            start_time_secs: 1_700_000_002,
             process_name: "caffeinate".into(),
             app_name: "caffeinate".into(),
             bundle_path: None,
@@ -237,6 +272,7 @@ pub fn demo_snapshot() -> DashboardSnapshot {
         },
         SleepBlocker {
             pid: 344,
+            start_time_secs: 1_700_000_000,
             process_name: "powerd".into(),
             app_name: "powerd".into(),
             bundle_path: None,
@@ -258,10 +294,11 @@ pub fn demo_snapshot() -> DashboardSnapshot {
                 id: "app:Google Chrome".into(),
                 name: "Google Chrome".into(),
                 primary_pid: 48102,
+                primary_start_time_secs: 1_700_000_010,
                 bundle_path: Some("/Applications/Google Chrome.app".into()),
                 helper_count: 18,
                 cpu_pct: 42.4,
-                footprint_bytes: 6_871_947_673, // 6.4 GB
+                footprint_bytes: 6_871_947_673,
                 energy_impact: 54.8,
                 wakeups_per_sec: 842.0,
                 verdict: "runaway".into(),
@@ -272,6 +309,7 @@ pub fn demo_snapshot() -> DashboardSnapshot {
                     ProcessRow {
                         pid: 48210,
                         ppid: 48102,
+                        start_time_secs: 1_700_000_001,
                         name: "Google Chrome Helper (Renderer)".into(),
                         path: Some("/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helpers/Google Chrome Helper (Renderer).app".into()),
                         cpu_pct: 28.6,
@@ -283,6 +321,7 @@ pub fn demo_snapshot() -> DashboardSnapshot {
                     ProcessRow {
                         pid: 48144,
                         ppid: 48102,
+                        start_time_secs: 1_700_000_011,
                         name: "Google Chrome Helper (GPU)".into(),
                         path: None,
                         cpu_pct: 8.9,
@@ -294,6 +333,7 @@ pub fn demo_snapshot() -> DashboardSnapshot {
                     ProcessRow {
                         pid: 48102,
                         ppid: 1,
+                        start_time_secs: 1_700_000_010,
                         name: "Google Chrome".into(),
                         path: Some("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into()),
                         cpu_pct: 4.9,
@@ -308,6 +348,7 @@ pub fn demo_snapshot() -> DashboardSnapshot {
                 id: "app:Cursor".into(),
                 name: "Cursor".into(),
                 primary_pid: 39011,
+                primary_start_time_secs: 1_700_000_020,
                 bundle_path: Some("/Applications/Cursor.app".into()),
                 helper_count: 11,
                 cpu_pct: 18.7,
@@ -322,6 +363,7 @@ pub fn demo_snapshot() -> DashboardSnapshot {
                     ProcessRow {
                         pid: 39118,
                         ppid: 39011,
+                        start_time_secs: 1_700_000_021,
                         name: "Cursor Helper (Plugin)".into(),
                         path: None,
                         cpu_pct: 12.1,
@@ -333,6 +375,7 @@ pub fn demo_snapshot() -> DashboardSnapshot {
                     ProcessRow {
                         pid: 39011,
                         ppid: 1,
+                        start_time_secs: 1_700_000_020,
                         name: "Cursor".into(),
                         path: Some("/Applications/Cursor.app/Contents/MacOS/Cursor".into()),
                         cpu_pct: 6.6,
@@ -347,6 +390,7 @@ pub fn demo_snapshot() -> DashboardSnapshot {
                 id: "app:Slack".into(),
                 name: "Slack".into(),
                 primary_pid: 27410,
+                primary_start_time_secs: 1_700_000_030,
                 bundle_path: Some("/Applications/Slack.app".into()),
                 helper_count: 6,
                 cpu_pct: 5.4,
@@ -360,6 +404,7 @@ pub fn demo_snapshot() -> DashboardSnapshot {
                 children: vec![ProcessRow {
                     pid: 27451,
                     ppid: 27410,
+                    start_time_secs: 1_700_000_031,
                     name: "Slack Helper (Renderer)".into(),
                     path: None,
                     cpu_pct: 4.1,
@@ -373,6 +418,7 @@ pub fn demo_snapshot() -> DashboardSnapshot {
                 id: "sys:WindowServer".into(),
                 name: "WindowServer".into(),
                 primary_pid: 406,
+                primary_start_time_secs: 1_700_000_000,
                 bundle_path: None,
                 helper_count: 1,
                 cpu_pct: 9.2,
@@ -386,6 +432,7 @@ pub fn demo_snapshot() -> DashboardSnapshot {
                 children: vec![ProcessRow {
                     pid: 406,
                     ppid: 1,
+                    start_time_secs: 1_700_000_000,
                     name: "WindowServer".into(),
                     path: Some("/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer".into()),
                     cpu_pct: 9.2,
@@ -395,31 +442,15 @@ pub fn demo_snapshot() -> DashboardSnapshot {
                     is_system_protected: true,
                 }],
             },
-            AppProcessGroup {
-                id: "sys:kernel_task".into(),
-                name: "kernel_task".into(),
-                primary_pid: 0,
-                bundle_path: None,
-                helper_count: 1,
-                cpu_pct: 6.1,
-                footprint_bytes: 0,
-                energy_impact: 6.1,
-                wakeups_per_sec: 0.0,
-                verdict: "system".into(),
-                is_system_protected: true,
-                is_blocking_sleep: false,
-                mostly_in: Some("macOS kernel · high CPU here means thermal throttling protection, not a bug".into()),
-                children: vec![],
-            },
         ],
         memory_pressure: MemoryPressureInfo {
             level: "green".into(),
-            total_bytes: 34_359_738_368,      // 32 GB
-            used_bytes: 21_904_333_209,       // 20.4 GB
-            wired_bytes: 4_509_715_660,       // 4.2 GB
-            compressed_bytes: 3_650_722_201,  // 3.4 GB
-            swap_used_bytes: 536_870_912,     // 512 MB
-            swap_total_bytes: 2_147_483_648,  // 2 GB
+            total_bytes: 34_359_738_368,
+            used_bytes: 21_904_333_209,
+            wired_bytes: 4_509_715_660,
+            compressed_bytes: 3_650_722_201,
+            swap_used_bytes: 536_870_912,
+            swap_total_bytes: 2_147_483_648,
         },
         total_cpu_pct: 81.8,
         total_footprint_bytes: 12_401_298_635,
@@ -435,7 +466,7 @@ pub fn demo_snapshot() -> DashboardSnapshot {
             recommended_value: "0".into(),
             severity: "warning".into(),
             title: "Power Nap enabled on battery".into(),
-            explanation: "Triggers periodic DarkWakes on battery for Mail, iCloud, and Time Machine.".into(),
+            explanation: "Triggers periodic silent wakes on battery for Mail, iCloud, and Time Machine.".into(),
             fix_command: Some("sudo pmset -b powernap 0".into()),
         },
         PmsetAuditItem {
@@ -445,8 +476,8 @@ pub fn demo_snapshot() -> DashboardSnapshot {
             current_value: "1".into(),
             recommended_value: "0".into(),
             severity: "warning".into(),
-            title: "TCPKeepAlive active on battery (28 DarkWakes seen)".into(),
-            explanation: "Common cause of `wifibt` + `SMC.OutboxNotEmpty` overnight wake loops.".into(),
+            title: "TCPKeepAlive active on battery (26 silent wakes)".into(),
+            explanation: "Common cause of Wi-Fi / Bluetooth overnight wake loops. Disabling pauses Find My while asleep.".into(),
             fix_command: Some("sudo pmset -b tcpkeepalive 0".into()),
         },
         PmsetAuditItem {

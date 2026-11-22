@@ -27,14 +27,19 @@ pub struct AppState {
     pub allow_exit: Arc<AtomicBool>,
 }
 
+/// Runs off the main UI thread via `spawn_blocking` so heavy polls (`pmset` / `libproc`) never stall UI interactions.
 #[tauri::command]
-fn get_dashboard_snapshot(
+async fn get_dashboard_snapshot(
     state: State<'_, AppState>,
+    include_sleep: Option<bool>,
     force_sleep_refresh: Option<bool>,
-) -> DashboardSnapshot {
-    state
-        .engine
-        .snapshot(force_sleep_refresh.unwrap_or(false), false)
+) -> Result<DashboardSnapshot, String> {
+    let engine = Arc::clone(&state.engine);
+    let inc = include_sleep.unwrap_or(false);
+    let force = force_sleep_refresh.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || engine.snapshot(inc, force, false))
+        .await
+        .map_err(|e| format!("telemetry task failed: {e}"))
 }
 
 #[tauri::command]
@@ -61,18 +66,10 @@ fn set_keep_awake(
 }
 
 #[tauri::command]
-fn set_demo_mode(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> bool {
-    let v = state.engine.set_demo(enabled);
-    let power = state.engine.read_power_fast();
-    let ka = state.engine.keep_awake.state();
-    update_tray_title(&app, power.system_watts, ka.active);
-    v
-}
-
-#[tauri::command]
 fn quit_process(
     state: State<'_, AppState>,
     pid: i32,
+    expected_start_secs: Option<u64>,
     app_name: Option<String>,
 ) -> ActionResult {
     if state.engine.is_demo() {
@@ -84,13 +81,14 @@ fn quit_process(
             ),
         };
     }
-    quit_process_safe(pid, app_name.as_deref())
+    quit_process_safe(pid, expected_start_secs, app_name.as_deref())
 }
 
 #[tauri::command]
 fn force_kill_process(
     state: State<'_, AppState>,
     pid: i32,
+    expected_start_secs: Option<u64>,
     confirmed: bool,
 ) -> ActionResult {
     if !confirmed {
@@ -105,7 +103,7 @@ fn force_kill_process(
             message: format!("[demo] Force-killed PID {pid}"),
         };
     }
-    force_kill_process_safe(pid, confirmed)
+    force_kill_process_safe(pid, expected_start_secs, confirmed)
 }
 
 #[tauri::command]
@@ -113,15 +111,18 @@ fn hide_dashboard(app: AppHandle, state: State<'_, AppState>) {
     hide_and_schedule_destroy(&app, &state.engine, &state.destroy_gen);
 }
 
-fn format_tray_title(watts: f64, awake: bool) -> String {
+fn format_tray_title(watts: Option<f64>, awake: bool) -> String {
+    let w = watts
+        .map(|v| format!("{v:.1}W"))
+        .unwrap_or_else(|| "--.-W".into());
     if awake {
-        format!("{watts:.1}W · ☕")
+        format!("{w} · ☕")
     } else {
-        format!("{watts:.1}W")
+        w
     }
 }
 
-fn update_tray_title(app: &AppHandle, watts: f64, awake: bool) {
+fn update_tray_title(app: &AppHandle, watts: Option<f64>, awake: bool) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let title = format_tray_title(watts, awake);
         let _ = tray.set_title(Some(title));
@@ -130,8 +131,9 @@ fn update_tray_title(app: &AppHandle, watts: f64, awake: bool) {
 
 fn open_or_show_window(app: &AppHandle) {
     let state = app.state::<AppState>();
-    // Cancel any pending 60s WebView destroy timer.
+    // Cancel any pending 60s WebView destroy timer and wake on-demand `macmon` sampling.
     state.destroy_gen.fetch_add(1, Ordering::SeqCst);
+    state.engine.set_dashboard_active(true);
 
     if let Some(win) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         let _ = win.show();
@@ -141,7 +143,7 @@ fn open_or_show_window(app: &AppHandle) {
 
     let saved = state.engine.load_window_bounds();
     let width = saved.as_ref().map(|b| b.width as f64).unwrap_or(800.0);
-    let height = saved.as_ref().map(|b| b.height as f64).unwrap_or(520.0);
+    let height = saved.as_ref().map(|b| b.height as f64).unwrap_or(560.0);
 
     let mut builder = WebviewWindowBuilder::new(
         app,
@@ -189,6 +191,9 @@ fn hide_and_schedule_destroy(
     engine: &Arc<TelemetryEngine>,
     destroy_gen: &Arc<AtomicU64>,
 ) {
+    // Park `macmon::Sampler` immediately so hidden idle state has 0 macmon wakeups/sec.
+    engine.set_dashboard_active(false);
+
     if let Some(win) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         if let (Ok(pos), Ok(size)) = (win.outer_position(), win.inner_size()) {
             let scale = win.scale_factor().unwrap_or(1.0);
@@ -202,7 +207,6 @@ fn hide_and_schedule_destroy(
         let _ = win.hide();
     }
 
-    // Hybrid Lazy-Destroy WebviewWindow: if still hidden after 60s, destroy WebView to drop RAM <20 MB.
     let my_gen = destroy_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let gen_ref = Arc::clone(destroy_gen);
     let app_clone = app.clone();
@@ -258,7 +262,6 @@ pub fn run_gui(demo_mode: bool) {
             get_dashboard_snapshot,
             toggle_keep_awake,
             set_keep_awake,
-            set_demo_mode,
             quit_process,
             force_kill_process,
             hide_dashboard,
@@ -266,7 +269,6 @@ pub fn run_gui(demo_mode: bool) {
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             {
-                // Menu-bar-first Accessory app — no Dock icon.
                 app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             }
 
@@ -317,12 +319,9 @@ pub fn run_gui(demo_mode: bool) {
                 })
                 .build(app)?;
 
-            // Open dashboard immediately on first launch so user sees it right away.
             open_or_show_window(app.handle());
 
-            // 24/7 lightweight Rust background loop:
-            // - Updates tray title every 2.5s ONLY when formatted text changes.
-            // - Writes coarse SQLite WAL sample & runs Keep-Awake guardrails every 60s.
+            // 24/7 lightweight Rust tray & SQLite logger loop (uses PSTR + AppleSmartBattery only, zero macmon overhead when hidden).
             let bg_handle = app.handle().clone();
             let bg_engine = Arc::clone(&engine);
             thread::Builder::new()
@@ -332,13 +331,8 @@ pub fn run_gui(demo_mode: bool) {
                     let mut tick_count: u64 = 0;
 
                     loop {
-                        let (power, ka) = if tick_count % 24 == 0 {
-                            bg_engine.tick_background_sample()
-                        } else {
-                            let p = bg_engine.read_power_fast();
-                            let k = bg_engine.keep_awake.enforce_guardrails(&p, &[]);
-                            (p, k)
-                        };
+                        let record_sample = tick_count % 24 == 0;
+                        let (power, ka) = bg_engine.tick_tray(record_sample);
 
                         let next_title = format_tray_title(power.system_watts, ka.active);
                         if next_title != last_title {
@@ -361,7 +355,6 @@ pub fn run_gui(demo_mode: bool) {
     app.run(move |_app_handle, event| {
         if let RunEvent::ExitRequested { api, .. } = event {
             if !exit_flag.load(Ordering::SeqCst) {
-                // Keep 24/7 tray daemon alive even after lazy-destroying the WebView window.
                 api.prevent_exit();
             }
         }

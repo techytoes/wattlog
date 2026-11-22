@@ -178,6 +178,7 @@ impl ProcessMonitor {
             name: String,
             bundle_path: Option<String>,
             primary_pid: i32,
+            primary_start_time_secs: u64,
             is_system: bool,
             is_blocking: bool,
             cpu_pct: f64,
@@ -226,6 +227,7 @@ impl ProcessMonitor {
                 name: app_name.clone(),
                 bundle_path: bundle_path.clone(),
                 primary_pid: row.pid,
+                primary_start_time_secs: row.start_time_secs,
                 is_system: row.is_system_protected,
                 is_blocking: blocks,
                 cpu_pct: 0.0,
@@ -238,6 +240,7 @@ impl ProcessMonitor {
             // Prefer the parent/main binary as primary_pid (lowest pid or matching app name).
             if row.name == entry.name || row.pid < entry.primary_pid {
                 entry.primary_pid = row.pid;
+                entry.primary_start_time_secs = row.start_time_secs;
             }
             if blocks {
                 entry.is_blocking = true;
@@ -312,6 +315,7 @@ impl ProcessMonitor {
                     id: g.id,
                     name: g.name,
                     primary_pid: g.primary_pid,
+                    primary_start_time_secs: g.primary_start_time_secs,
                     bundle_path: g.bundle_path,
                     helper_count,
                     cpu_pct: (g.cpu_pct * 10.0).round() / 10.0,
@@ -378,6 +382,7 @@ impl ProcessMonitor {
             let pid = pid_u32 as i32;
             let bsd = pidinfo::<BSDInfo>(pid, 0).ok();
             let ppid = bsd.as_ref().map(|b| b.pbi_ppid as i32).unwrap_or(1);
+            let start_time_secs = bsd.as_ref().map(|b| b.pbi_start_tvsec).unwrap_or(0);
 
             let path = process_path_for_pid(pid);
             let bsd_name = bsd
@@ -477,6 +482,7 @@ impl ProcessMonitor {
                 ProcessRow {
                     pid,
                     ppid,
+                    start_time_secs,
                     name: proc_name,
                     path,
                     cpu_pct: (cpu_pct * 10.0).round() / 10.0,
@@ -510,8 +516,47 @@ pub fn process_path_for_pid(pid: i32) -> Option<String> {
     }
 }
 
-/// Safe graceful Quit (`SIGTERM`, or Apple Event quit for `.app` bundles) protected by system denylist.
-pub fn quit_process_safe(pid: i32, app_name: Option<&str>) -> ActionResult {
+pub fn process_start_time_for_pid(pid: i32) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        use libproc::libproc::bsd_info::BSDInfo;
+        use libproc::libproc::proc_pid::pidinfo;
+        pidinfo::<BSDInfo>(pid, 0).ok().map(|b| b.pbi_start_tvsec)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+fn validate_pid_identity(pid: i32, expected_start_secs: Option<u64>) -> Result<(), String> {
+    if let Some(expected) = expected_start_secs.filter(|&s| s > 0) {
+        match process_start_time_for_pid(pid) {
+            Some(actual) if actual == expected => Ok(()),
+            Some(_) => Err(format!(
+                "Aborted: PID {pid} was reused by a different process."
+            )),
+            None => Err(format!("Process PID {pid} is no longer running.")),
+        }
+    } else {
+        Ok(())
+    }
+}
+
+/// Safe graceful Quit (`SIGTERM`, or Apple Event quit for `.app` bundles) protected by system denylist & start-time revalidation.
+pub fn quit_process_safe(
+    pid: i32,
+    expected_start_secs: Option<u64>,
+    app_name: Option<&str>,
+) -> ActionResult {
+    if let Err(msg) = validate_pid_identity(pid, expected_start_secs) {
+        return ActionResult {
+            ok: false,
+            message: msg,
+        };
+    }
+
     let path = process_path_for_pid(pid);
     let proc_name = path
         .as_deref()
@@ -527,7 +572,6 @@ pub fn quit_process_safe(pid: i32, app_name: Option<&str>) -> ActionResult {
         };
     }
 
-    // If this is a GUI `.app` bundle, try a clean Apple Event quit first for graceful document saving.
     if let Some(name) = app_name {
         if path.as_deref().map(|p| p.contains(".app/")).unwrap_or(false)
             && !name.contains("Helper")
@@ -566,12 +610,23 @@ pub fn quit_process_safe(pid: i32, app_name: Option<&str>) -> ActionResult {
     }
 }
 
-/// 2-keypress confirmed Force Kill (`SIGKILL`) protected by system denylist.
-pub fn force_kill_process_safe(pid: i32, confirmed: bool) -> ActionResult {
+/// 2-keypress confirmed Force Kill (`SIGKILL`) protected by system denylist & start-time revalidation.
+pub fn force_kill_process_safe(
+    pid: i32,
+    expected_start_secs: Option<u64>,
+    confirmed: bool,
+) -> ActionResult {
     if !confirmed {
         return ActionResult {
             ok: false,
             message: "Force kill requires explicit 2-keypress confirmation.".into(),
+        };
+    }
+
+    if let Err(msg) = validate_pid_identity(pid, expected_start_secs) {
+        return ActionResult {
+            ok: false,
+            message: msg,
         };
     }
 

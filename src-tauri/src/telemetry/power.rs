@@ -1,5 +1,5 @@
 use std::ffi::{c_char, c_void, CString};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,91 +14,116 @@ pub struct CachedComponentMetrics {
 
 pub struct PowerReader {
     component_cache: Arc<Mutex<Option<CachedComponentMetrics>>>,
-    macmon_available: Arc<Mutex<bool>>,
+    macmon_gate: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl PowerReader {
     pub fn new(start_background_macmon: bool) -> Self {
         let component_cache = Arc::new(Mutex::new(None));
-        let macmon_available = Arc::new(Mutex::new(false));
+        let macmon_gate = Arc::new((Mutex::new(false), Condvar::new()));
 
         if start_background_macmon {
             #[cfg(target_os = "macos")]
-            Self::spawn_macmon_thread(Arc::clone(&component_cache), Arc::clone(&macmon_available));
+            Self::spawn_macmon_thread(Arc::clone(&component_cache), Arc::clone(&macmon_gate));
         }
 
         Self {
             component_cache,
-            macmon_available,
+            macmon_gate,
+        }
+    }
+
+    /// Enable or park the on-demand `macmon` worker thread.
+    /// When `active == false` (WebView hidden/destroyed), `macmon::Sampler` is dropped so
+    /// IOReport & SMC handles are released and idle CPU wakeups drop to 0/sec.
+    pub fn set_dashboard_active(&self, active: bool) {
+        let (lock, cvar) = &*self.macmon_gate;
+        if let Ok(mut guard) = lock.lock() {
+            if *guard != active {
+                *guard = active;
+                cvar.notify_all();
+            }
+        }
+        if !active {
+            if let Ok(mut cache) = self.component_cache.lock() {
+                *cache = None;
+            }
         }
     }
 
     #[cfg(target_os = "macos")]
     fn spawn_macmon_thread(
         cache: Arc<Mutex<Option<CachedComponentMetrics>>>,
-        available: Arc<Mutex<bool>>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
     ) {
         thread::Builder::new()
             .name("wattlog-macmon".into())
             .spawn(move || {
-                let mut sampler = match macmon::Sampler::new() {
-                    Ok(s) => {
-                        if let Ok(mut flag) = available.lock() {
-                            *flag = true;
-                        }
-                        s
-                    }
-                    Err(_) => {
-                        // Graceful fallback if macOS tightens entitlements or on non-Apple Silicon.
-                        return;
-                    }
-                };
-
+                let (lock, cvar) = &*gate;
                 loop {
-                    match sampler.get_metrics(1000) {
-                        Ok(m) => {
-                            let cpu_w = sanitize_watts(m.cpu_power as f64);
-                            let gpu_w = sanitize_watts(m.gpu_power as f64);
-                            let ane_w = sanitize_watts(m.ane_power as f64);
-                            let dram_w = sanitize_watts(m.ram_power as f64);
-                            let sys_w = sanitize_watts(m.sys_power as f64);
-                            let comp_sum = cpu_w + gpu_w + ane_w + dram_w;
-                            let display_other = (sys_w - comp_sum).max(0.0);
-                            let fan_rpm = m.fans.first().map(|f| f.rpm);
-
-                            let comp = ComponentPower {
-                                cpu_watts: round2(cpu_w),
-                                gpu_watts: round2(gpu_w),
-                                ane_watts: round2(ane_w),
-                                dram_watts: round2(dram_w),
-                                sys_watts: round2(sys_w),
-                                display_other_watts: round2(display_other),
-                                cpu_temp_c: m.temp.cpu_temp_avg.map(|t| round1(t as f64)),
-                                gpu_temp_c: m.temp.gpu_temp_avg.map(|t| round1(t as f64)),
-                                cpu_active_pct: round1((m.cpu_active_ratio as f64 * 100.0).clamp(0.0, 100.0)),
-                                gpu_active_pct: round1((m.gpu_active_ratio as f64 * 100.0).clamp(0.0, 100.0)),
-                                fan_rpm,
-                                available: true,
+                    // Park with 0 wakeups/sec whenever the dashboard window is hidden/destroyed.
+                    {
+                        let Ok(mut active) = lock.lock() else {
+                            return;
+                        };
+                        while !*active {
+                            active = match cvar.wait(active) {
+                                Ok(g) => g,
+                                Err(_) => return,
                             };
-                            if let Ok(mut guard) = cache.lock() {
-                                *guard = Some(CachedComponentMetrics {
-                                    data: comp,
-                                    updated_at: Instant::now(),
-                                });
+                        }
+                    }
+
+                    // Window is visible: open Sampler cleanly (dropped as soon as window hides).
+                    let mut sampler = match macmon::Sampler::new() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            // Graceful fallback if macOS tightens entitlements or unsupported CPU.
+                            let Ok(active) = lock.lock() else {
+                                return;
+                            };
+                            let _ = cvar.wait_timeout(active, Duration::from_secs(30));
+                            continue;
+                        }
+                    };
+
+                    loop {
+                        let still_active = lock.lock().map(|g| *g).unwrap_or(false);
+                        if !still_active {
+                            // Drop `sampler` immediately to free IOReport/SMC resources!
+                            break;
+                        }
+
+                        match sampler.get_metrics(1000) {
+                            Ok(m) => {
+                                let comp = build_component_power(&m);
+                                if let Ok(mut guard) = cache.lock() {
+                                    *guard = Some(CachedComponentMetrics {
+                                        data: comp,
+                                        updated_at: Instant::now(),
+                                    });
+                                }
+                            }
+                            Err(_) => {
+                                thread::sleep(Duration::from_secs(2));
                             }
                         }
-                        Err(_) => {
-                            thread::sleep(Duration::from_secs(3));
+
+                        // Sleep 500ms interruptibly via Condvar so hiding the window drops immediately.
+                        if let Ok(active) = lock.lock() {
+                            if !*active {
+                                break;
+                            }
+                            let _ = cvar.wait_timeout(active, Duration::from_millis(500));
                         }
                     }
-                    // Low-overhead cadence between samples (~1s sample + 1s rest = 2s).
-                    thread::sleep(Duration::from_millis(1000));
+                    drop(sampler);
                 }
             })
             .ok();
     }
 
-    /// Take a single synchronous macmon sample for CLI (`--plain` / `--json`) mode.
+    /// Single synchronous macmon sample for CLI (`--plain` / `--json`) mode.
     #[cfg(target_os = "macos")]
     pub fn sample_components_once(&self, interval_ms: u32) -> Option<ComponentPower> {
         if let Ok(guard) = self.component_cache.lock() {
@@ -110,26 +135,7 @@ impl PowerReader {
         }
         let mut sampler = macmon::Sampler::new().ok()?;
         let m = sampler.get_metrics(interval_ms.clamp(120, 1000)).ok()?;
-        let cpu_w = sanitize_watts(m.cpu_power as f64);
-        let gpu_w = sanitize_watts(m.gpu_power as f64);
-        let ane_w = sanitize_watts(m.ane_power as f64);
-        let dram_w = sanitize_watts(m.ram_power as f64);
-        let sys_w = sanitize_watts(m.sys_power as f64);
-        let comp_sum = cpu_w + gpu_w + ane_w + dram_w;
-        Some(ComponentPower {
-            cpu_watts: round2(cpu_w),
-            gpu_watts: round2(gpu_w),
-            ane_watts: round2(ane_w),
-            dram_watts: round2(dram_w),
-            sys_watts: round2(sys_w),
-            display_other_watts: round2((sys_w - comp_sum).max(0.0)),
-            cpu_temp_c: m.temp.cpu_temp_avg.map(|t| round1(t as f64)),
-            gpu_temp_c: m.temp.gpu_temp_avg.map(|t| round1(t as f64)),
-            cpu_active_pct: round1((m.cpu_active_ratio as f64 * 100.0).clamp(0.0, 100.0)),
-            gpu_active_pct: round1((m.gpu_active_ratio as f64 * 100.0).clamp(0.0, 100.0)),
-            fan_rpm: m.fans.first().map(|f| f.rpm),
-            available: true,
-        })
+        Some(build_component_power(&m))
     }
 
     pub fn read_snapshot(&self, sync_macmon_if_empty: bool) -> PowerSnapshot {
@@ -139,47 +145,53 @@ impl PowerReader {
                 .component_cache
                 .lock()
                 .ok()
-                .and_then(|g| g.as_ref().map(|c| c.data.clone()));
+                .and_then(|g| {
+                    g.as_ref()
+                        .filter(|c| c.updated_at.elapsed() < Duration::from_secs(10))
+                        .map(|c| c.data.clone())
+                });
 
             if components.is_none() && sync_macmon_if_empty {
                 components = self.sample_components_once(250);
             }
 
             let smart = macos_iokit::read_apple_smart_battery();
-            let smc_pstr = if smart
+
+            // Priority 1: Always prefer real-time `AppleSMC` `PSTR` (cached via macmon or read directly).
+            // Avoids the ~50s AppleSmartBattery lag AND the Apple Silicon `SystemLoad` charging inflation bug!
+            let pstr_watts = components
                 .as_ref()
-                .map(|s| s.system_load_watts.unwrap_or(0.0) <= 0.05)
-                .unwrap_or(true)
-            {
-                macos_iokit::read_smc_pstr()
-            } else {
-                None
-            };
+                .map(|c| c.sys_watts)
+                .filter(|&w| w > 0.05 && w < 400.0)
+                .or_else(macos_iokit::read_smc_pstr);
+
+            let soc_floor_watts = components.as_ref().and_then(|c| {
+                let sum = c.cpu_watts + c.gpu_watts + c.ane_watts + c.dram_watts;
+                (sum > 0.05 && sum < 400.0).then_some(sum)
+            });
 
             if let Some(sb) = smart {
                 let signed_batt_w =
                     (sb.battery.amperage_ma as f64 * sb.battery.voltage_mv as f64) / 1_000_000.0;
 
-                // Tier 1: AppleSmartBattery PowerTelemetryData.SystemLoad (most accurate on Apple Silicon)
-                // Fallback to |InstantAmperage * Voltage| while discharging, then AppleSMC PSTR, then macmon sys_power.
-                let (system_watts, mut tier) = if let Some(load_w) = sb.system_load_watts.filter(|w| *w > 0.05) {
-                    (load_w, "AppleSmartBattery".to_string())
-                } else if !sb.battery.external_connected && signed_batt_w.abs() > 0.05 {
-                    (signed_batt_w.abs(), "AppleSmartBattery (I×V)".to_string())
-                } else if let Some(pstr) = smc_pstr.filter(|w| *w > 0.05) {
-                    (pstr, "AppleSMC (PSTR)".to_string())
-                } else if let Some(comp) = components.as_ref().filter(|c| c.sys_watts > 0.05) {
-                    (comp.sys_watts, "macmon (IOReport)".to_string())
-                } else {
-                    (signed_batt_w.abs(), "AppleSmartBattery".to_string())
-                };
+                let (system_watts, mut tier) = resolve_laptop_system_watts(
+                    pstr_watts,
+                    sb.system_load_watts,
+                    sb.system_power_in_watts,
+                    signed_batt_w,
+                    sb.battery.external_connected,
+                    sb.battery.is_charging,
+                    soc_floor_watts,
+                );
 
-                if let Some(ref mut comp) = components {
+                if let (Some(total_w), Some(ref mut comp)) = (system_watts, &mut components) {
                     let parts = comp.cpu_watts + comp.gpu_watts + comp.ane_watts + comp.dram_watts;
-                    if system_watts > parts {
-                        comp.display_other_watts = round2((system_watts - parts).max(0.0));
+                    if total_w > parts {
+                        comp.display_other_watts = round2((total_w - parts).max(0.0));
+                    } else {
+                        comp.display_other_watts = 0.0;
                     }
-                    if comp.available && !tier.contains("macmon") {
+                    if comp.available && !tier.contains("macmon") && tier != "unavailable" {
                         tier.push_str(" + macmon");
                     }
                 }
@@ -195,7 +207,7 @@ impl PowerReader {
                 };
 
                 return PowerSnapshot {
-                    system_watts: round2(system_watts),
+                    system_watts: system_watts.map(round2),
                     battery_watts: round2(signed_batt_w),
                     source_tier: tier,
                     state,
@@ -205,17 +217,24 @@ impl PowerReader {
                 };
             }
 
-            // Desktop Mac (Mac Studio / Mac Mini / Mac Pro) — Tier 2 AppleSMC PSTR -> Tier 3 macmon
-            let (system_watts, tier) = if let Some(pstr) = smc_pstr.filter(|w| *w > 0.05) {
-                (pstr, "AppleSMC (PSTR)".to_string())
-            } else if let Some(comp) = components.as_ref().filter(|c| c.sys_watts > 0.05) {
-                (comp.sys_watts, "macmon (IOReport)".to_string())
+            // Desktop Mac (Mac Mini / Mac Studio / Mac Pro)
+            let (system_watts, tier) = if let Some(pstr) = pstr_watts {
+                (
+                    Some(pstr),
+                    if components.is_some() {
+                        "AppleSMC (PSTR) + macmon".to_string()
+                    } else {
+                        "AppleSMC (PSTR)".to_string()
+                    },
+                )
+            } else if let Some(soc) = soc_floor_watts {
+                (Some(soc), "macmon (SoC only)".to_string())
             } else {
-                (0.0, "unavailable".to_string())
+                (None, "unavailable".to_string())
             };
 
             return PowerSnapshot {
-                system_watts: round2(system_watts),
+                system_watts: system_watts.map(round2),
                 battery_watts: 0.0,
                 source_tier: tier,
                 state: PowerState::AcOnly,
@@ -237,7 +256,7 @@ impl PowerReader {
         {
             let _ = sync_macmon_if_empty;
             PowerSnapshot {
-                system_watts: 0.0,
+                system_watts: None,
                 battery_watts: 0.0,
                 source_tier: "unavailable".into(),
                 state: PowerState::AcOnly,
@@ -247,9 +266,82 @@ impl PowerReader {
             }
         }
     }
+}
 
-    pub fn is_macmon_active(&self) -> bool {
-        self.macmon_available.lock().map(|g| *g).unwrap_or(false)
+/// Verified power fallback resolution across discharging, AC charging, AC held/full, and sensor failure.
+fn resolve_laptop_system_watts(
+    pstr_watts: Option<f64>,
+    system_load_watts: Option<f64>,
+    system_power_in_watts: Option<f64>,
+    signed_batt_w: f64,
+    external_connected: bool,
+    is_charging: bool,
+    soc_floor_watts: Option<f64>,
+) -> (Option<f64>, String) {
+    // 1. Real-time AppleSMC PSTR is accurate in every power state.
+    if let Some(pstr) = pstr_watts.filter(|&w| w > 0.05 && w < 400.0) {
+        return (Some(pstr), "AppleSMC (PSTR)".into());
+    }
+
+    if !external_connected {
+        // Discharging on battery
+        if let Some(load) = system_load_watts.filter(|&w| w > 0.05 && w < 400.0) {
+            return (Some(load), "AppleSmartBattery".into());
+        }
+        if signed_batt_w < -0.05 && signed_batt_w.abs() < 400.0 {
+            return (Some(signed_batt_w.abs()), "AppleSmartBattery (I×V)".into());
+        }
+    } else if is_charging {
+        // Actively charging on AC:
+        // NEVER use SystemLoad (inflated by SystemPowerIn - BatteryPower) and NEVER use |I×V|!
+        if let Some(pin) = system_power_in_watts.filter(|&w| w > 0.05 && w < 400.0) {
+            if signed_batt_w > 0.0 && pin > signed_batt_w {
+                let diff = pin - signed_batt_w;
+                if diff > 0.05 && diff < 400.0 {
+                    return (Some(diff), "AppleSmartBattery (In−Batt)".into());
+                }
+            }
+        }
+    } else {
+        // Plugged into AC at 100% / held charge
+        if let Some(load) = system_load_watts.filter(|&w| w > 0.05 && w < 400.0) {
+            return (Some(load), "AppleSmartBattery".into());
+        }
+        if let Some(pin) = system_power_in_watts.filter(|&w| w > 0.05 && w < 400.0) {
+            if signed_batt_w.abs() < 1.0 {
+                return (Some(pin), "AppleSmartBattery (In)".into());
+            }
+        }
+    }
+
+    if let Some(soc) = soc_floor_watts.filter(|&w| w > 0.05 && w < 400.0) {
+        return (Some(soc), "macmon (SoC only)".into());
+    }
+
+    (None, "unavailable".into())
+}
+
+#[cfg(target_os = "macos")]
+fn build_component_power(m: &macmon::Metrics) -> ComponentPower {
+    let cpu_w = sanitize_watts(m.cpu_power as f64);
+    let gpu_w = sanitize_watts(m.gpu_power as f64);
+    let ane_w = sanitize_watts(m.ane_power as f64);
+    let dram_w = sanitize_watts(m.ram_power as f64);
+    let sys_w = sanitize_watts(m.sys_power as f64);
+    let comp_sum = cpu_w + gpu_w + ane_w + dram_w;
+    ComponentPower {
+        cpu_watts: round2(cpu_w),
+        gpu_watts: round2(gpu_w),
+        ane_watts: round2(ane_w),
+        dram_watts: round2(dram_w),
+        sys_watts: round2(sys_w),
+        display_other_watts: round2((sys_w - comp_sum).max(0.0)),
+        cpu_temp_c: m.temp.cpu_temp_avg.map(|t| round1(t as f64)),
+        gpu_temp_c: m.temp.gpu_temp_avg.map(|t| round1(t as f64)),
+        cpu_active_pct: round1((m.cpu_active_ratio as f64 * 100.0).clamp(0.0, 100.0)),
+        gpu_active_pct: round1((m.gpu_active_ratio as f64 * 100.0).clamp(0.0, 100.0)),
+        fan_rpm: m.fans.first().map(|f| f.rpm),
+        available: true,
     }
 }
 
@@ -324,6 +416,7 @@ mod macos_iokit {
         pub battery: BatteryInfo,
         pub adapter: Option<AdapterInfo>,
         pub system_load_watts: Option<f64>,
+        pub system_power_in_watts: Option<f64>,
     }
 
     fn dict_get_i64(dict: &CFDictionary<CFString, CFType>, key: &str) -> Option<i64> {
@@ -354,14 +447,12 @@ mod macos_iokit {
         let k = CFString::new(key);
         let val = dict.find(&k)?;
         let sub = val.downcast::<CFDictionary>()?;
-        // Safety: AppleSmartBattery sub-dictionaries have CFString keys and CFType values.
         unsafe {
             let cf_ref: CFDictionaryRef = sub.as_concrete_TypeRef();
             Some(CFDictionary::<CFString, CFType>::wrap_under_get_rule(cf_ref))
         }
     }
 
-    /// Tier 1: Direct zero-root IOKit read of `AppleSmartBattery`.
     pub fn read_apple_smart_battery() -> Option<SmartBatteryReading> {
         let cname = CString::new("AppleSmartBattery").ok()?;
         unsafe {
@@ -410,7 +501,6 @@ mod macos_iokit {
                 .unwrap_or(1000)
                 .max(1) as u32;
             let voltage_mv = dict_get_i64(&dict, "Voltage").unwrap_or(0).max(0) as u32;
-            // InstantAmperage is signed two's complement 64-bit integer in mA (negative = discharging).
             let amperage_ma = dict_get_i64(&dict, "InstantAmperage").unwrap_or(0);
             let temp_centi = dict_get_i64(&dict, "Temperature").unwrap_or(0);
             let temperature_c = round1(temp_centi as f64 / 100.0);
@@ -440,14 +530,19 @@ mod macos_iokit {
                 health_pct
             };
 
-            // PowerTelemetryData.SystemLoad is reported in mW on Apple Silicon!
-            let system_load_watts = dict_get_subdict(&dict, "PowerTelemetryData").and_then(|ptd| {
-                dict_get_i64(&ptd, "SystemLoad")
-                    .filter(|&mw| mw > 0 && mw < 400_000)
-                    .map(|mw| mw as f64 / 1000.0)
-            });
+            let (system_load_watts, system_power_in_watts) =
+                match dict_get_subdict(&dict, "PowerTelemetryData") {
+                    Some(ptd) => (
+                        dict_get_i64(&ptd, "SystemLoad")
+                            .filter(|&mw| mw > 0 && mw < 400_000)
+                            .map(|mw| mw as f64 / 1000.0),
+                        dict_get_i64(&ptd, "SystemPowerIn")
+                            .filter(|&mw| mw > 0 && mw < 400_000)
+                            .map(|mw| mw as f64 / 1000.0),
+                    ),
+                    None => (None, None),
+                };
 
-            // AdapterDetails (USB-C PD negotiated wattage / voltage / current)
             let adapter = dict_get_subdict(&dict, "AdapterDetails").map(|ad| {
                 let watts = dict_get_i64(&ad, "Watts")
                     .filter(|&w| w > 0)
@@ -493,11 +588,11 @@ mod macos_iokit {
                 },
                 adapter,
                 system_load_watts,
+                system_power_in_watts,
             })
         }
     }
 
-    // ---- Tier 2: Read-only AppleSMC `PSTR` key fallback ----
     #[repr(C)]
     #[derive(Default, Copy, Clone)]
     struct SmcKeyDataVers {
@@ -560,7 +655,7 @@ mod macos_iokit {
         u32::from_be_bytes(*s)
     }
 
-    /// Read-only AppleSMC `PSTR` (System Total Power) in Watts. Zero-root, read-only selector.
+    /// Read-only AppleSMC `PSTR` (System Total Power) in Watts. Zero-root.
     pub fn read_smc_pstr() -> Option<f64> {
         let cname = CString::new("AppleSMC").ok()?;
         unsafe {
@@ -622,7 +717,6 @@ mod macos_iokit {
                 return None;
             }
 
-            // Apple Silicon `PSTR` is IEEE-754 little-endian `flt ` (4 bytes).
             if data_type == fourcc(b"flt ") && data_size == 4 {
                 let val = f32::from_le_bytes([
                     output.bytes[0],
@@ -630,7 +724,7 @@ mod macos_iokit {
                     output.bytes[2],
                     output.bytes[3],
                 ]) as f64;
-                if val.is_finite() && val > 0.0 && val < 400.0 {
+                if val.is_finite() && val > 0.05 && val < 400.0 {
                     return Some(val);
                 }
             }
@@ -644,10 +738,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn charging_fallback_ignores_inflated_system_load_and_batt_charge_current() {
+        // Real observed M3 Pro charging case: SystemPowerIn=55.09W, batt=+46.90W, SystemLoad=73.63W
+        let (w, tier) = resolve_laptop_system_watts(
+            None,
+            Some(73.63),
+            Some(55.09),
+            46.90,
+            true,
+            true,
+            None,
+        );
+        assert_eq!(tier, "AppleSmartBattery (In−Batt)");
+        assert!((w.unwrap() - 8.19).abs() < 0.05);
+
+        // When PSTR is present while charging, PSTR wins immediately.
+        let (w2, tier2) = resolve_laptop_system_watts(
+            Some(8.88),
+            Some(73.63),
+            Some(55.09),
+            46.90,
+            true,
+            true,
+            Some(2.84),
+        );
+        assert_eq!(tier2, "AppleSMC (PSTR)");
+        assert!((w2.unwrap() - 8.88).abs() < 0.01);
+
+        // When all sources fail while charging, return None (never 46.90W or 0.0W!).
+        let (w3, tier3) = resolve_laptop_system_watts(None, Some(73.63), None, 46.90, true, true, None);
+        assert!(w3.is_none());
+        assert_eq!(tier3, "unavailable");
+    }
+
+    #[test]
     fn reads_local_power_snapshot_without_panic() {
         let reader = PowerReader::new(false);
         let snap = reader.read_snapshot(false);
-        assert!(snap.system_watts >= 0.0);
         assert!(!snap.source_tier.is_empty());
+        if let Some(w) = snap.system_watts {
+            assert!(w > 0.0 && w < 400.0);
+        }
     }
 }

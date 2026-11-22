@@ -24,6 +24,7 @@ let browserKeepAwake: KeepAwakeState = {
 };
 
 function makeBrowserFallbackSnapshot(): DashboardSnapshot {
+  const now = Date.now();
   const timeline = Array.from({ length: 48 }, (_, i) => {
     const hour = (15 + Math.floor(i / 2)) % 24;
     const min = (i % 2) * 30;
@@ -57,7 +58,7 @@ function makeBrowserFallbackSnapshot(): DashboardSnapshot {
           watts: 3.4,
           chargePct: pct,
           durationSecs: 1800,
-          detail: "3 DarkWakes · wifibt SMC.OutboxNotEmpty",
+          detail: "3 silent wakes · Wi-Fi / Bluetooth",
         };
       }
       return {
@@ -66,17 +67,7 @@ function makeBrowserFallbackSnapshot(): DashboardSnapshot {
         watts: 0.3,
         chargePct: pct,
         durationSecs: 1800,
-        detail: "Deep Idle sleep",
-      };
-    }
-    if (i < 39) {
-      return {
-        label,
-        state: "blocked" as const,
-        watts: 11.2,
-        chargePct: 77 - (i - 34),
-        durationSecs: 1800,
-        detail: "Sleep blocked · Chrome WebRTC",
+        detail: "Asleep (Deep Idle)",
       };
     }
     return {
@@ -94,8 +85,8 @@ function makeBrowserFallbackSnapshot(): DashboardSnapshot {
     label: "Wi-Fi / Bluetooth Radio Wake",
     category: "bluetooth",
     explanation:
-      "Wireless radio (AirDrop, Find My, Handoff, or Bluetooth accessory) woke the Mac during sleep.",
-    tip: "Disable Power Nap / TCPKeepAlive on battery or turn off Bluetooth mouse before packing.",
+      "Wireless radio (AirDrop, Find My, Handoff, or a paired Bluetooth accessory) woke the Mac during sleep.",
+    tip: "Disable Power Nap or TCPKeepAlive on battery.",
     isInsomniaSuspect: true,
   };
   const rtc = {
@@ -108,7 +99,7 @@ function makeBrowserFallbackSnapshot(): DashboardSnapshot {
   };
 
   return {
-    timestampMs: Date.now(),
+    timestampMs: now,
     demoMode: true,
     hostName: "MacBook-Pro.local",
     chipName: "Apple M3 Pro",
@@ -116,7 +107,7 @@ function makeBrowserFallbackSnapshot(): DashboardSnapshot {
     power: {
       systemWatts: 8.4,
       batteryWatts: -8.4,
-      sourceTier: "AppleSmartBattery + macmon (preview)",
+      sourceTier: "AppleSMC (PSTR) + macmon (preview)",
       state: "discharging",
       battery: {
         chargePct: 74,
@@ -163,14 +154,21 @@ function makeBrowserFallbackSnapshot(): DashboardSnapshot {
     sleep: {
       sinceUnplug: {
         startedAt: "Nov 21 18:10",
+        unplugTsMs: now - 77200_000,
+        unplugSource: "samples",
+        dataStatus: "ok",
+        historyCoverageSecs: 86400,
         elapsedSecs: 77200,
         startChargePct: 98,
         currentChargePct: 74,
         totalDropPct: 24,
-        activeSecs: 28400,
-        sleepSecs: 48354,
-        darkWakeSecs: 446,
-        darkWakeCount: 28,
+        asleepDrainPct: 17,
+        activeDrainPct: 7,
+        sleepSessionCount: 1,
+        activeSecs: 46542,
+        sleepSecs: 30240,
+        darkWakeSecs: 418,
+        darkWakeCount: 26,
         drainPctPerHour: 1.1,
         onBatteryNow: true,
       },
@@ -179,6 +177,8 @@ function makeBrowserFallbackSnapshot(): DashboardSnapshot {
           id: "demo-sleep-1",
           startTime: "Nov 21 23:18",
           endTime: "Nov 22 07:42",
+          startMs: now - 59000_000,
+          endMs: now - 28760_000,
           durationSecs: 30240,
           startChargePct: 88,
           endChargePct: 71,
@@ -209,9 +209,14 @@ function makeBrowserFallbackSnapshot(): DashboardSnapshot {
             },
           ],
           severity: "critical",
+          inCurrentUnplug: true,
         },
       ],
       topWakeReasons: [
+        { decoded: wifibt, count: 19, totalSecs: 304 },
+        { decoded: rtc, count: 7, totalSecs: 114 },
+      ],
+      sinceUnplugWakeReasons: [
         { decoded: wifibt, count: 19, totalSecs: 304 },
         { decoded: rtc, count: 7, totalSecs: 114 },
       ],
@@ -221,6 +226,7 @@ function makeBrowserFallbackSnapshot(): DashboardSnapshot {
     blockers: [
       {
         pid: 48210,
+        startTimeSecs: 1700000001,
         processName: "Google Chrome Helper (Renderer)",
         appName: "Google Chrome",
         bundlePath: "/Applications/Google Chrome.app",
@@ -234,36 +240,6 @@ function makeBrowserFallbackSnapshot(): DashboardSnapshot {
         blocksDisplay: true,
         blocksSystem: true,
       },
-      {
-        pid: 51904,
-        processName: "caffeinate",
-        appName: "caffeinate",
-        bundlePath: null,
-        assertionType: "PreventUserIdleSystemSleep",
-        assertionName: "caffeinate command-line tool",
-        details: "Started from terminal session",
-        durationSecs: 1845,
-        severity: "warning",
-        isSystemProtected: false,
-        isSelfWattlog: false,
-        blocksDisplay: false,
-        blocksSystem: true,
-      },
-      {
-        pid: 344,
-        processName: "powerd",
-        appName: "powerd",
-        bundlePath: null,
-        assertionType: "PreventUserIdleSystemSleep",
-        assertionName: "Powerd - Prevent sleep while display is on",
-        details: "Normal macOS assertion while screen is awake",
-        durationSecs: 8112,
-        severity: "system",
-        isSystemProtected: true,
-        isSelfWattlog: false,
-        blocksDisplay: false,
-        blocksSystem: true,
-      },
     ],
     keepAwake: browserKeepAwake,
     processes: {
@@ -272,6 +248,7 @@ function makeBrowserFallbackSnapshot(): DashboardSnapshot {
           id: "app:Google Chrome",
           name: "Google Chrome",
           primaryPid: 48102,
+          primaryStartTimeSecs: 1700000010,
           bundlePath: "/Applications/Google Chrome.app",
           helperCount: 18,
           cpuPct: 42.4,
@@ -286,51 +263,13 @@ function makeBrowserFallbackSnapshot(): DashboardSnapshot {
             {
               pid: 48210,
               ppid: 48102,
+              startTimeSecs: 1700000001,
               name: "Google Chrome Helper (Renderer)",
               path: null,
               cpuPct: 28.6,
               footprintBytes: 4402341478,
               energyImpact: 38.2,
               wakeupsPerSec: 610,
-              isSystemProtected: false,
-            },
-            {
-              pid: 48144,
-              ppid: 48102,
-              name: "Google Chrome Helper (GPU)",
-              path: null,
-              cpuPct: 8.9,
-              footprintBytes: 1288490188,
-              energyImpact: 11.4,
-              wakeupsPerSec: 164,
-              isSystemProtected: false,
-            },
-          ],
-        },
-        {
-          id: "app:Cursor",
-          name: "Cursor",
-          primaryPid: 39011,
-          bundlePath: "/Applications/Cursor.app",
-          helperCount: 11,
-          cpuPct: 18.7,
-          footprintBytes: 3435973836,
-          energyImpact: 22.1,
-          wakeupsPerSec: 312,
-          verdict: "elevated",
-          isSystemProtected: false,
-          isBlockingSleep: false,
-          mostlyIn: "Cursor Helper (Plugin) · 1.9 GB · 214 wakeups/s",
-          children: [
-            {
-              pid: 39118,
-              ppid: 39011,
-              name: "Cursor Helper (Plugin)",
-              path: null,
-              cpuPct: 12.1,
-              footprintBytes: 2040109465,
-              energyImpact: 14.3,
-              wakeupsPerSec: 214,
               isSystemProtected: false,
             },
           ],
@@ -358,30 +297,23 @@ function makeBrowserFallbackSnapshot(): DashboardSnapshot {
         recommendedValue: "0",
         severity: "warning",
         title: "Power Nap enabled on battery",
-        explanation: "Triggers periodic DarkWakes on battery for Mail, iCloud, and Time Machine.",
+        explanation: "Triggers periodic silent wakes on battery for Mail, iCloud, and Time Machine.",
         fixCommand: "sudo pmset -b powernap 0",
-      },
-      {
-        id: "demo-tcpkeepalive",
-        profile: "Battery Power",
-        key: "tcpkeepalive",
-        currentValue: "1",
-        recommendedValue: "0",
-        severity: "warning",
-        title: "TCPKeepAlive active on battery (28 DarkWakes seen)",
-        explanation: "Common cause of wifibt + SMC.OutboxNotEmpty overnight wake loops.",
-        fixCommand: "sudo pmset -b tcpkeepalive 0",
       },
     ],
     history: [],
   };
 }
 
-export async function fetchSnapshot(forceSleepRefresh = false): Promise<DashboardSnapshot> {
+export async function fetchSnapshot(
+  includeSleep = false,
+  forceSleepRefresh = false,
+): Promise<DashboardSnapshot> {
   if (!isTauriRuntime()) {
     return makeBrowserFallbackSnapshot();
   }
   return invoke<DashboardSnapshot>("get_dashboard_snapshot", {
+    includeSleep,
     forceSleepRefresh,
   });
 }
@@ -414,23 +346,34 @@ export async function setKeepAwake(config: KeepAwakeConfig): Promise<KeepAwakeSt
   return invoke<KeepAwakeState>("set_keep_awake", { config });
 }
 
-export async function setDemoMode(enabled: boolean): Promise<boolean> {
-  if (!isTauriRuntime()) return enabled;
-  return invoke<boolean>("set_demo_mode", { enabled });
-}
-
-export async function quitProcess(pid: number, appName?: string | null): Promise<ActionResult> {
+export async function quitProcess(
+  pid: number,
+  expectedStartSecs?: number | null,
+  appName?: string | null,
+): Promise<ActionResult> {
   if (!isTauriRuntime()) {
     return { ok: true, message: `[preview] Sent graceful Quit to ${appName ?? `PID ${pid}`}` };
   }
-  return invoke<ActionResult>("quit_process", { pid, appName: appName ?? null });
+  return invoke<ActionResult>("quit_process", {
+    pid,
+    expectedStartSecs: expectedStartSecs ?? null,
+    appName: appName ?? null,
+  });
 }
 
-export async function forceKillProcess(pid: number, confirmed: boolean): Promise<ActionResult> {
+export async function forceKillProcess(
+  pid: number,
+  expectedStartSecs: number | null | undefined,
+  confirmed: boolean,
+): Promise<ActionResult> {
   if (!isTauriRuntime()) {
     return { ok: true, message: `[preview] Force-killed PID ${pid}` };
   }
-  return invoke<ActionResult>("force_kill_process", { pid, confirmed });
+  return invoke<ActionResult>("force_kill_process", {
+    pid,
+    expectedStartSecs: expectedStartSecs ?? null,
+    confirmed,
+  });
 }
 
 export async function hideDashboard(): Promise<void> {

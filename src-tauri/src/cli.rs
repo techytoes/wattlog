@@ -31,10 +31,9 @@ pub fn run_cli_if_requested(args: &CliArgs) -> bool {
 
     let engine = TelemetryEngine::new(args.demo, false);
     if !args.demo {
-        // Brief pause so CPU%/wakeups/s deltas between two proc_pid_rusage snapshots are non-zero.
         std::thread::sleep(std::time::Duration::from_millis(350));
     }
-    let snapshot = engine.snapshot(true, true);
+    let snapshot = engine.snapshot(true, true, true);
 
     if args.json {
         match serde_json::to_string_pretty(&snapshot) {
@@ -59,7 +58,6 @@ pub fn format_plain_report(s: &DashboardSnapshot) -> String {
         s.host_name, s.chip_name, s.macos_version, mode_tag
     ));
 
-    // Hero power line
     let state_str = match s.power.state {
         PowerState::Discharging => "discharging",
         PowerState::Charging => "charging",
@@ -67,14 +65,20 @@ pub fn format_plain_report(s: &DashboardSnapshot) -> String {
         PowerState::AcOnly => "ac power",
     };
 
+    let watts_str = s
+        .power
+        .system_watts
+        .map(|w| format!("{w:.1}W"))
+        .unwrap_or_else(|| "--.-W".into());
+
     if let Some(ref b) = s.power.battery {
         let eta = b
             .time_remaining_mins
             .map(|m| format!(" · {}h {:02}m", m / 60, m % 60))
             .unwrap_or_default();
         out.push_str(&format!(
-            "{:.1}W  {}  {}%{}  ·  {:.0}% health ({} cycles)  ·  {:.1}°C  [{}]\n",
-            s.power.system_watts,
+            "{}  {}  {}%{}  ·  {:.0}% health ({} cycles)  ·  {:.1}°C  [{}]\n",
+            watts_str,
             state_str,
             b.charge_pct,
             eta,
@@ -85,8 +89,8 @@ pub fn format_plain_report(s: &DashboardSnapshot) -> String {
         ));
     } else {
         out.push_str(&format!(
-            "{:.1}W  {}  [{}]\n",
-            s.power.system_watts, state_str, s.power.source_tier
+            "{}  {}  [{}]\n",
+            watts_str, state_str, s.power.source_tier
         ));
     }
 
@@ -101,22 +105,21 @@ pub fn format_plain_report(s: &DashboardSnapshot) -> String {
         ));
     }
 
-    // Since Last Unplug & Sleep Post-Mortem
     out.push_str("\nsince last unplug & sleep post-mortem\n");
     let u = &s.sleep.since_unplug;
     if let Some(ref started) = u.started_at {
         out.push_str(&format!(
-            "  unplugged {} · -{}% ({:.1}%/hr) · active {} · sleep {} · {} DarkWakes ({})\n",
+            "  unplugged {} ({}) · -{}% (active -{}%, asleep -{}%) · {} silent wakes ({})\n",
             started,
+            u.unplug_source,
             u.total_drop_pct,
-            u.drain_pct_per_hour,
-            fmt_dur(u.active_secs),
-            fmt_dur(u.sleep_secs),
+            u.active_drain_pct,
+            u.asleep_drain_pct,
             u.dark_wake_count,
             fmt_dur(u.dark_wake_secs),
         ));
     } else {
-        out.push_str("  no battery discharge window found in pmset log\n");
+        out.push_str(&format!("  status: {}\n", u.data_status));
     }
 
     for sess in s.sleep.sessions.iter().take(4) {
@@ -126,7 +129,7 @@ pub fn format_plain_report(s: &DashboardSnapshot) -> String {
             .map(|w| format!(" · mostly {} ({})", w.token, w.label))
             .unwrap_or_default();
         out.push_str(&format!(
-            "  {} → {}  {:>6}  -{:>2}%  {:>2} DarkWakes  [{}]{}\n",
+            "  {} → {}  {:>6}  -{:>2}%  {:>2} wakes  [{}]{}\n",
             sess.start_time,
             sess.end_time,
             fmt_dur(sess.duration_secs),
@@ -137,7 +140,6 @@ pub fn format_plain_report(s: &DashboardSnapshot) -> String {
         ));
     }
 
-    // Live Sleep Blockers
     let active_user_blockers: Vec<_> = s
         .blockers
         .iter()
@@ -164,7 +166,6 @@ pub fn format_plain_report(s: &DashboardSnapshot) -> String {
         }
     }
 
-    // Grouped Apps · CPU / Memory Pressure
     let mp = &s.processes.memory_pressure;
     out.push_str(&format!(
         "\ngrouped apps · memory pressure: {} (used {} / {}, swap {})\n",
@@ -198,7 +199,6 @@ pub fn format_plain_report(s: &DashboardSnapshot) -> String {
         }
     }
 
-    // pmset Footgun Audit
     let warn_audit: Vec<_> = s.audit.iter().filter(|a| a.severity != "ok").collect();
     out.push_str(&format!("\nsystem pmset audit ({} findings)\n", warn_audit.len()));
     if warn_audit.is_empty() {

@@ -3,11 +3,16 @@ import type { TimelineBucket } from "../types";
 
 interface SleepChartProps {
   timeline: TimelineBucket[];
-  unpluggedAt: string | null;
   currentChargePct: number | null;
 }
 
-export function SleepChart({ timeline, unpluggedAt, currentChargePct }: SleepChartProps) {
+/**
+ * Literal 24-hour battery & sleep chart:
+ * - Uses the actual first bucket timestamp (never substitutes unplug time).
+ * - Leaves clean breaks where charge % is unknown (never invents 80%).
+ * - Labels sleep bands "asleep" (covers both lid-closed and open-lid idle sleep).
+ */
+export function SleepChart({ timeline, currentChargePct }: SleepChartProps) {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
 
   if (timeline.length === 0) {
@@ -15,10 +20,10 @@ export function SleepChart({ timeline, unpluggedAt, currentChargePct }: SleepCha
       <div className="graph-well">
         <div className="gw-head">
           <span>BATTERY OVER LAST 24 HOURS</span>
-          <span>waiting for pmset sleep log data</span>
+          <span>no recent pmset history</span>
         </div>
         <div style={{ padding: "18px 0", textAlign: "center", color: "#5C6475" }}>
-          No recent sleep/wake history yet.
+          Insufficient sleep/wake history in macOS power log.
         </div>
       </div>
     );
@@ -29,26 +34,38 @@ export function SleepChart({ timeline, unpluggedAt, currentChargePct }: SleepCha
   const chartTop = 8;
   const step = w / Math.max(1, timeline.length - 1);
 
-  // Fill missing charge % smoothly from neighbors
-  let lastKnown = currentChargePct ?? 80;
-  const charges = timeline.map((b) => {
-    if (b.chargePct !== null) {
-      lastKnown = b.chargePct;
-      return b.chargePct;
-    }
-    return lastKnown;
-  });
-
   const yOf = (pct: number) =>
     chartBottom - (Math.max(0, Math.min(100, pct)) / 100) * (chartBottom - chartTop);
 
-  const linePath = charges
-    .map((pct, i) => `${i === 0 ? "M" : "L"}${(i * step).toFixed(1)} ${yOf(pct).toFixed(1)}`)
-    .join(" ");
-  const areaPath = `${linePath} L${w} ${chartBottom} L0 ${chartBottom} Z`;
+  // Build segmented line + area paths, leaving gaps wherever `chargePct === null`.
+  const lineSegments: string[] = [];
+  const areaSegments: string[] = [];
+  let run: Array<{ x: number; y: number }> = [];
+
+  const flushRun = () => {
+    if (run.length >= 2) {
+      const lp = run
+        .map((p, idx) => `${idx === 0 ? "M" : "L"}${p.x.toFixed(1)} ${p.y.toFixed(1)}`)
+        .join(" ");
+      lineSegments.push(lp);
+      areaSegments.push(
+        `${lp} L${run[run.length - 1].x.toFixed(1)} ${chartBottom} L${run[0].x.toFixed(1)} ${chartBottom} Z`,
+      );
+    }
+    run = [];
+  };
+
+  timeline.forEach((b, i) => {
+    if (b.chargePct !== null) {
+      run.push({ x: i * step, y: yOf(b.chargePct) });
+    } else {
+      flushRun();
+    }
+  });
+  flushRun();
 
   const hovered = hoverIdx !== null ? timeline[hoverIdx] : null;
-  const firstLabel = unpluggedAt ?? timeline[0]?.label ?? "24h ago";
+  const firstLabel = timeline[0]?.label ?? "";
   const midLabel = timeline[Math.floor(timeline.length / 2)]?.label ?? "";
 
   return (
@@ -58,7 +75,7 @@ export function SleepChart({ timeline, unpluggedAt, currentChargePct }: SleepCha
           {hovered ? (
             <>
               <strong style={{ color: "#FFFFFF" }}>{hovered.label}</strong>
-              {hovered.chargePct !== null ? ` · ${hovered.chargePct}%` : ""} ·{" "}
+              {hovered.chargePct !== null ? ` · ${hovered.chargePct}%` : " · —"} ·{" "}
               <span
                 style={{
                   color:
@@ -68,7 +85,9 @@ export function SleepChart({ timeline, unpluggedAt, currentChargePct }: SleepCha
                         ? "#4ADE80"
                         : hovered.state === "charging"
                           ? "#A855F7"
-                          : "#38BDF8",
+                          : hovered.state === "empty"
+                            ? "#64748B"
+                            : "#38BDF8",
                 }}
               >
                 {hovered.detail}
@@ -83,7 +102,7 @@ export function SleepChart({ timeline, unpluggedAt, currentChargePct }: SleepCha
             <span style={{ color: "#38BDF8" }}>━</span> battery %
           </span>
           <span>
-            <span style={{ color: "#22C55E" }}>■</span> lid closed
+            <span style={{ color: "#22C55E" }}>■</span> asleep
           </span>
           <span>
             <span style={{ color: "#F97316" }}>│</span> silent wakes
@@ -108,7 +127,6 @@ export function SleepChart({ timeline, unpluggedAt, currentChargePct }: SleepCha
           </linearGradient>
         </defs>
 
-        {/* Horizontal 50% and 0% subtle grid */}
         <line
           x1="0"
           y1={yOf(50)}
@@ -119,7 +137,6 @@ export function SleepChart({ timeline, unpluggedAt, currentChargePct }: SleepCha
         />
         <line x1="0" y1={chartBottom} x2={w} y2={chartBottom} stroke="rgba(255,255,255,0.08)" />
 
-        {/* Shaded state bands + DarkWake spikes */}
         {timeline.map((b, i) => {
           const x = i * step;
           const bw = Math.max(step + 0.5, 4);
@@ -148,6 +165,7 @@ export function SleepChart({ timeline, unpluggedAt, currentChargePct }: SleepCha
             );
           }
           if (b.state === "darkwake") {
+            const topY = b.chargePct !== null ? yOf(b.chargePct) : chartTop + 6;
             return (
               <g key={`dw-${i}`}>
                 <rect
@@ -159,7 +177,7 @@ export function SleepChart({ timeline, unpluggedAt, currentChargePct }: SleepCha
                 />
                 <line
                   x1={x}
-                  y1={yOf(charges[i])}
+                  y1={topY}
                   x2={x}
                   y2={chartBottom}
                   stroke="#F97316"
@@ -184,18 +202,21 @@ export function SleepChart({ timeline, unpluggedAt, currentChargePct }: SleepCha
           return null;
         })}
 
-        {/* Battery % area & crisp curve */}
-        <path d={areaPath} fill="url(#wattlogBattArea)" />
-        <path
-          d={linePath}
-          fill="none"
-          stroke="#38BDF8"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
+        {areaSegments.map((d, idx) => (
+          <path key={`a-${idx}`} d={d} fill="url(#wattlogBattArea)" />
+        ))}
+        {lineSegments.map((d, idx) => (
+          <path
+            key={`l-${idx}`}
+            d={d}
+            fill="none"
+            stroke="#38BDF8"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        ))}
 
-        {/* Hover scrub vertical cursor */}
         {hoverIdx !== null && hoverIdx < timeline.length && (
           <>
             <line
@@ -206,11 +227,17 @@ export function SleepChart({ timeline, unpluggedAt, currentChargePct }: SleepCha
               stroke="rgba(255,255,255,0.28)"
               strokeWidth="1"
             />
-            <circle cx={hoverIdx * step} cy={yOf(charges[hoverIdx])} r="3.4" fill="#FFFFFF" />
+            {timeline[hoverIdx].chargePct !== null && (
+              <circle
+                cx={hoverIdx * step}
+                cy={yOf(timeline[hoverIdx].chargePct!)}
+                r="3.4"
+                fill="#FFFFFF"
+              />
+            )}
           </>
         )}
 
-        {/* Axis labels */}
         <text x="0" y="70" fill="#636C80" fontSize="9.5" fontFamily="SF Mono, monospace">
           {firstLabel}
         </text>

@@ -20,11 +20,11 @@ pub struct DashboardSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PowerSnapshot {
-    /// Total system draw in Watts (positive magnitude)
-    pub system_watts: f64,
+    /// Total system draw in Watts (`None` when all power sensors are unavailable).
+    pub system_watts: Option<f64>,
     /// Net battery flow in Watts (negative = discharging, positive = charging)
     pub battery_watts: f64,
-    /// Power source tier used ("AppleSmartBattery", "AppleSMC", "macmon", "demo", "unavailable")
+    /// Power source tier used ("AppleSMC (PSTR)", "AppleSmartBattery", "AppleSmartBattery (In−Batt)", "macmon (SoC only)", "unavailable", etc.)
     pub source_tier: String,
     pub state: PowerState,
     pub battery: Option<BatteryInfo>,
@@ -97,6 +97,7 @@ pub struct SleepReport {
     pub since_unplug: SinceUnplugSummary,
     pub sessions: Vec<SleepSession>,
     pub top_wake_reasons: Vec<WakeReasonAggregate>,
+    pub since_unplug_wake_reasons: Vec<WakeReasonAggregate>,
     pub timeline: Vec<TimelineBucket>,
     pub raw_log_available: bool,
 }
@@ -105,10 +106,19 @@ pub struct SleepReport {
 #[serde(rename_all = "camelCase")]
 pub struct SinceUnplugSummary {
     pub started_at: Option<String>,
+    pub unplug_ts_ms: Option<i64>,
+    /// "samples" | "pmset" | "unknown"
+    pub unplug_source: String,
+    /// "ok" | "insufficient_history" | "no_battery_sleep" | "on_ac" | "log_unavailable"
+    pub data_status: String,
+    pub history_coverage_secs: u64,
     pub elapsed_secs: u64,
     pub start_charge_pct: Option<u8>,
     pub current_charge_pct: Option<u8>,
     pub total_drop_pct: i32,
+    pub asleep_drain_pct: i32,
+    pub active_drain_pct: i32,
+    pub sleep_session_count: u32,
     pub active_secs: u64,
     pub sleep_secs: u64,
     pub dark_wake_secs: u64,
@@ -123,6 +133,8 @@ pub struct SleepSession {
     pub id: String,
     pub start_time: String,
     pub end_time: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
     pub duration_secs: u64,
     pub start_charge_pct: Option<u8>,
     pub end_charge_pct: Option<u8>,
@@ -134,6 +146,7 @@ pub struct SleepSession {
     pub worst_wake_reason: Option<DecodedWakeReason>,
     pub wake_events: Vec<WakeEvent>,
     pub severity: String, // "ok" | "warning" | "critical"
+    pub in_current_unplug: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,7 +166,7 @@ pub struct WakeEvent {
 pub struct DecodedWakeReason {
     pub token: String,
     pub label: String,
-    pub category: String, // "network" | "bluetooth" | "hardware" | "usb" | "schedule" | "user" | "power" | "system"
+    pub category: String,
     pub explanation: String,
     pub tip: String,
     pub is_insomnia_suspect: bool,
@@ -183,6 +196,7 @@ pub struct TimelineBucket {
 #[serde(rename_all = "camelCase")]
 pub struct SleepBlocker {
     pub pid: i32,
+    pub start_time_secs: u64,
     pub process_name: String,
     pub app_name: String,
     pub bundle_path: Option<String>,
@@ -255,6 +269,7 @@ pub struct AppProcessGroup {
     pub id: String,
     pub name: String,
     pub primary_pid: i32,
+    pub primary_start_time_secs: u64,
     pub bundle_path: Option<String>,
     pub helper_count: usize,
     pub cpu_pct: f64,
@@ -274,6 +289,7 @@ pub struct AppProcessGroup {
 pub struct ProcessRow {
     pub pid: i32,
     pub ppid: i32,
+    pub start_time_secs: u64,
     pub name: String,
     pub path: Option<String>,
     pub cpu_pct: f64,
@@ -300,7 +316,7 @@ pub struct MemoryPressureInfo {
 #[serde(rename_all = "camelCase")]
 pub struct PmsetAuditItem {
     pub id: String,
-    pub profile: String, // "Battery Power" | "AC Power"
+    pub profile: String,
     pub key: String,
     pub current_value: String,
     pub recommended_value: String,

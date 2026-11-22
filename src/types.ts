@@ -45,7 +45,7 @@ export interface ComponentPower {
 }
 
 export interface PowerSnapshot {
-  systemWatts: number;
+  systemWatts: number | null;
   batteryWatts: number;
   sourceTier: string;
   state: PowerState;
@@ -77,6 +77,8 @@ export interface SleepSession {
   id: string;
   startTime: string;
   endTime: string;
+  startMs: number;
+  endMs: number;
   durationSecs: number;
   startChargePct: number | null;
   endChargePct: number | null;
@@ -88,6 +90,7 @@ export interface SleepSession {
   worstWakeReason: DecodedWakeReason | null;
   wakeEvents: WakeEvent[];
   severity: "ok" | "warning" | "critical";
+  inCurrentUnplug: boolean;
 }
 
 export interface WakeReasonAggregate {
@@ -105,12 +108,26 @@ export interface TimelineBucket {
   detail: string;
 }
 
+export type SleepDataStatus =
+  | "ok"
+  | "insufficient_history"
+  | "no_battery_sleep"
+  | "on_ac"
+  | "log_unavailable";
+
 export interface SinceUnplugSummary {
   startedAt: string | null;
+  unplugTsMs: number | null;
+  unplugSource: "samples" | "pmset" | "unknown";
+  dataStatus: SleepDataStatus;
+  historyCoverageSecs: number;
   elapsedSecs: number;
   startChargePct: number | null;
   currentChargePct: number | null;
   totalDropPct: number;
+  asleepDrainPct: number;
+  activeDrainPct: number;
+  sleepSessionCount: number;
   activeSecs: number;
   sleepSecs: number;
   darkWakeSecs: number;
@@ -123,12 +140,14 @@ export interface SleepReport {
   sinceUnplug: SinceUnplugSummary;
   sessions: SleepSession[];
   topWakeReasons: WakeReasonAggregate[];
+  sinceUnplugWakeReasons: WakeReasonAggregate[];
   timeline: TimelineBucket[];
   rawLogAvailable: boolean;
 }
 
 export interface SleepBlocker {
   pid: number;
+  startTimeSecs: number;
   processName: string;
   appName: string;
   bundlePath: string | null;
@@ -168,6 +187,7 @@ export interface KeepAwakeState {
 export interface ProcessRow {
   pid: number;
   ppid: number;
+  startTimeSecs: number;
   name: string;
   path: string | null;
   cpuPct: number;
@@ -181,6 +201,7 @@ export interface AppProcessGroup {
   id: string;
   name: string;
   primaryPid: number;
+  primaryStartTimeSecs: number;
   bundlePath: string | null;
   helperCount: number;
   cpuPct: number;
@@ -256,5 +277,3 @@ export interface ActionResult {
   ok: boolean;
   message: string;
 }
-
-export type RailCategoryId = "unplug" | "blockers" | "awake" | "apps" | "audit";

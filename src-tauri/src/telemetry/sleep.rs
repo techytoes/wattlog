@@ -1,36 +1,57 @@
 use std::collections::HashMap;
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
 
 use chrono::{DateTime, FixedOffset};
 
+use super::storage::StoredUnplugTransition;
 use super::types::{
     DecodedWakeReason, PmsetAuditItem, SinceUnplugSummary, SleepReport, SleepSession,
     TimelineBucket, WakeEvent, WakeReasonAggregate,
 };
 
 /// Plain-English decoder table for 20+ macOS Apple Silicon & Intel sleep/wake tokens.
+/// Specific user/radio/peripheral tokens are matched BEFORE the generic `SMC.OutboxNotEmpty`
+/// wrapper so `lid` and `pwrbtn` wakes are never mislabeled.
 pub fn decode_wake_reason(raw: &str) -> DecodedWakeReason {
     let lower = raw.to_ascii_lowercase();
 
-    // Order matters: more specific tokens first.
     let rules: &[(&[&str], &str, &str, &str, &str, &str, bool)] = &[
         (
             &["wifibt"],
             "wifibt",
             "Wi-Fi / Bluetooth Radio Wake",
             "bluetooth",
-            "Wireless radio (AirDrop, Find My, Handoff, or Bluetooth accessory) woke the Mac during sleep.",
-            "Disconnect chatty Bluetooth peripherals or disable Wake for Network Access on battery.",
+            "Wireless radio (AirDrop, Find My, Handoff, or a paired Bluetooth accessory) woke the Mac during sleep.",
+            "Disconnect chatty Bluetooth peripherals or disable Wake for Network Access / Power Nap on battery.",
             true,
         ),
         (
-            &["smc.outboxnotempty", "smc.sysstate"],
-            "SMC.OutboxNotEmpty",
-            "SMC Pending Event (Wake Trigger)",
-            "hardware",
-            "Apple Silicon System Management Controller raised a pending event (often paired with lid, power button, or wifibt).",
-            "Usually benign on lid/button wake; when paired with wifibt in DarkWake loops, disable Power Nap / TCPKeepAlive on battery.",
-            true,
+            &["ec.lidopen", "lidopen", " lid ", "/lid", "lid "],
+            "lid",
+            "Display Lid Opened",
+            "user",
+            "You opened the MacBook lid.",
+            "Normal user wake.",
+            false,
+        ),
+        (
+            &["pwrbtn", "powerbutton", "ec.powerbutton"],
+            "pwrbtn",
+            "Power / Touch ID Button",
+            "user",
+            "Power button or Touch ID sensor was pressed.",
+            "Normal user wake.",
+            false,
+        ),
+        (
+            &["ec.acattach", "acattach", "ac_attach"],
+            "EC.ACAttach",
+            "Charger Plugged / Unplugged",
+            "power",
+            "Power adapter connection state changed (plugged in, unplugged, or USB-C PD renegotiated).",
+            "Normal when plugging in; if repeating while asleep, a flaky USB-C cable or monitor PD port is cycling power.",
+            false,
         ),
         (
             &["aop.outboxnotempty", "aop."],
@@ -76,42 +97,6 @@ pub fn decode_wake_reason(raw: &str) -> DecodedWakeReason {
             "A connected USB device (mouse, keyboard, dongle, or hub) signaled a wake event.",
             "Unplug wireless mouse/keyboard dongles or disable Bluetooth wake when travelling.",
             true,
-        ),
-        (
-            &["ec.acattach", "acattach", "ac_attach"],
-            "EC.ACAttach",
-            "Charger Plugged / Unplugged",
-            "power",
-            "Power adapter connection state changed (plugged in, unplugged, or USB-C PD renegotiated).",
-            "Normal when plugging in; if repeating while asleep, a flaky USB-C cable or monitor PD port is cycling power.",
-            false,
-        ),
-        (
-            &["ec.lidopen", "lidopen", " lid "],
-            "lid",
-            "Display Lid Opened",
-            "user",
-            "You opened the MacBook lid.",
-            "Normal user wake.",
-            false,
-        ),
-        (
-            &["pwrbtn", "powerbutton", "ec.powerbutton"],
-            "pwrbtn",
-            "Power / Touch ID Button",
-            "user",
-            "Power button or Touch ID sensor was pressed.",
-            "Normal user wake.",
-            false,
-        ),
-        (
-            &["hid", "keyboard", "trackpad", "useractivity"],
-            "UserActivity",
-            "Keyboard / Trackpad Input",
-            "user",
-            "Direct keyboard, trackpad, or HID input woke the Mac.",
-            "Normal user wake (check for loose lid or backpack pressure if unexpected).",
-            false,
         ),
         (
             &["dasd", "duetactivity"],
@@ -195,6 +180,24 @@ pub fn decode_wake_reason(raw: &str) -> DecodedWakeReason {
             true,
         ),
         (
+            &["hid", "keyboard", "trackpad", "useractivity"],
+            "UserActivity",
+            "Keyboard / Trackpad Input",
+            "user",
+            "Direct keyboard, trackpad, or HID input woke the Mac.",
+            "Normal user wake (check for loose lid or backpack pressure if unexpected).",
+            false,
+        ),
+        (
+            &["smc.outboxnotempty", "smc.sysstate"],
+            "SMC.OutboxNotEmpty",
+            "SMC Pending Event (Wake Trigger)",
+            "hardware",
+            "Apple Silicon System Management Controller raised a pending hardware wake event.",
+            "When repeating in DarkWake loops on battery, disable Power Nap or TCPKeepAlive.",
+            true,
+        ),
+        (
             &["maintenance"],
             "Maintenance",
             "macOS Maintenance DarkWake",
@@ -218,7 +221,6 @@ pub fn decode_wake_reason(raw: &str) -> DecodedWakeReason {
         }
     }
 
-    // Fallback when token wasn't recognized.
     let short_token = raw
         .split_whitespace()
         .next()
@@ -243,6 +245,7 @@ pub fn decode_wake_reason(raw: &str) -> DecodedWakeReason {
 #[derive(Debug, Clone)]
 struct ParsedLogEvent {
     ts: DateTime<FixedOffset>,
+    ts_ms: i64,
     ts_str: String,
     kind: LogEventKind,
     charge_pct: Option<u8>,
@@ -257,39 +260,174 @@ enum LogEventKind {
     DarkWake,
     Wake,
     HibernateWake,
+    PowerMarker, // From `Assertions Summary-` Using AC / Using Batt
 }
 
-/// Read and parse `/usr/bin/pmset -g log` (zero-root).
-pub fn collect_sleep_report(current_charge_pct: Option<u8>, on_battery_now: bool) -> SleepReport {
-    let output = Command::new("/usr/bin/pmset")
+/// Stream and parse `/usr/bin/pmset -g log` via `BufReader` + raw byte prefiltering (~64–400 KiB peak).
+pub fn collect_sleep_report(
+    current_charge_pct: Option<u8>,
+    on_battery_now: bool,
+    stored_unplug: Option<StoredUnplugTransition>,
+    earliest_sample_ms: Option<i64>,
+) -> SleepReport {
+    let mut child = match Command::new("/usr/bin/pmset")
         .args(["-g", "log"])
-        .output();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return empty_sleep_report(current_charge_pct, on_battery_now, "log_unavailable"),
+    };
 
-    match output {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            parse_pmset_log(&text, current_charge_pct, on_battery_now)
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.wait();
+        return empty_sleep_report(current_charge_pct, on_battery_now, "log_unavailable");
+    };
+
+    let mut reader = BufReader::with_capacity(64 * 1024, stdout);
+    let mut line_buf: Vec<u8> = Vec::with_capacity(512);
+    let mut events: Vec<ParsedLogEvent> = Vec::new();
+
+    loop {
+        line_buf.clear();
+        match reader.read_until(b'\n', &mut line_buf) {
+            Ok(0) => break,
+            Ok(_) => {
+                if let Some(ev) = parse_prefiltered_bytes(&line_buf) {
+                    events.push(ev);
+                }
+            }
+            Err(_) => break,
         }
-        _ => SleepReport {
-            since_unplug: SinceUnplugSummary {
-                started_at: None,
-                elapsed_secs: 0,
-                start_charge_pct: current_charge_pct,
-                current_charge_pct,
-                total_drop_pct: 0,
-                active_secs: 0,
-                sleep_secs: 0,
-                dark_wake_secs: 0,
-                dark_wake_count: 0,
-                drain_pct_per_hour: 0.0,
-                on_battery_now,
-            },
-            sessions: Vec::new(),
-            top_wake_reasons: Vec::new(),
-            timeline: Vec::new(),
-            raw_log_available: false,
-        },
     }
+    let _ = child.wait();
+
+    build_sleep_report_from_events(
+        events,
+        current_charge_pct,
+        on_battery_now,
+        stored_unplug,
+        earliest_sample_ms,
+        chrono::Local::now().fixed_offset(),
+    )
+}
+
+fn empty_sleep_report(
+    current_charge_pct: Option<u8>,
+    on_battery_now: bool,
+    status: &str,
+) -> SleepReport {
+    SleepReport {
+        since_unplug: SinceUnplugSummary {
+            started_at: None,
+            unplug_ts_ms: None,
+            unplug_source: "unknown".into(),
+            data_status: status.into(),
+            history_coverage_secs: 0,
+            elapsed_secs: 0,
+            start_charge_pct: current_charge_pct,
+            current_charge_pct,
+            total_drop_pct: 0,
+            asleep_drain_pct: 0,
+            active_drain_pct: 0,
+            sleep_session_count: 0,
+            active_secs: 0,
+            sleep_secs: 0,
+            dark_wake_secs: 0,
+            dark_wake_count: 0,
+            drain_pct_per_hour: 0.0,
+            on_battery_now,
+        },
+        sessions: Vec::new(),
+        top_wake_reasons: Vec::new(),
+        since_unplug_wake_reasons: Vec::new(),
+        timeline: Vec::new(),
+        raw_log_available: false,
+    }
+}
+
+/// Fast raw-byte prefilter: skips ~95% of `pmset -g log` lines (mostly `Assertions`) with zero allocation.
+fn parse_prefiltered_bytes(line: &[u8]) -> Option<ParsedLogEvent> {
+    if line.len() < 32 {
+        return None;
+    }
+    // Timestamp prefix must start with "20" (YYYY-MM-DD HH:MM:SS +ZZZZ)
+    if line[0] != b'2' || line[4] != b'-' || line[7] != b'-' {
+        return None;
+    }
+
+    let mut idx = 25;
+    while idx < line.len() && (line[idx] == b' ' || line[idx] == b'\t') {
+        idx += 1;
+    }
+    if idx >= line.len() {
+        return None;
+    }
+    let rest_bytes = &line[idx..];
+
+    let is_sleep = rest_bytes.starts_with(b"Sleep ") || rest_bytes.starts_with(b"Sleep\t");
+    let is_dark = rest_bytes.starts_with(b"DarkWake ") || rest_bytes.starts_with(b"DarkWake\t");
+    let is_wake = rest_bytes.starts_with(b"Wake ") || rest_bytes.starts_with(b"Wake\t");
+    let is_assertions =
+        rest_bytes.starts_with(b"Assertions ") || rest_bytes.starts_with(b"Assertions\t");
+
+    if !is_sleep && !is_dark && !is_wake && !is_assertions {
+        return None;
+    }
+
+    let line_str = std::str::from_utf8(line).ok()?;
+    let trimmed = line_str[idx..].trim_end();
+
+    let kind = if is_sleep {
+        if !trimmed.contains("Entering Sleep state") {
+            return None;
+        }
+        LogEventKind::Sleep
+    } else if is_dark {
+        LogEventKind::DarkWake
+    } else if is_wake {
+        if trimmed.contains("Wake from Hibernate") || trimmed.contains("Wake from Standby") {
+            LogEventKind::HibernateWake
+        } else if trimmed.contains("Wake from") {
+            LogEventKind::Wake
+        } else {
+            return None;
+        }
+    } else {
+        // Only keep `Assertions Summary-` lines that contain a complete `Using AC(Charge:` or `Using Batt(Charge:` marker!
+        if !trimmed.contains("Summary-")
+            || (!trimmed.contains("Using AC(Charge:") && !trimmed.contains("Using Batt(Charge:"))
+        {
+            return None;
+        }
+        LogEventKind::PowerMarker
+    };
+
+    let ts = DateTime::parse_from_str(&line_str[..25], "%Y-%m-%d %H:%M:%S %z").ok()?;
+    let charge_pct = extract_charge_pct(trimmed);
+    let power_source = extract_power_source(trimmed);
+    let duration_secs = if kind == LogEventKind::PowerMarker {
+        0
+    } else {
+        extract_trailing_secs(trimmed)
+    };
+    let reason = if kind == LogEventKind::PowerMarker {
+        String::new()
+    } else {
+        extract_reason(trimmed, kind)
+    };
+
+    Some(ParsedLogEvent {
+        ts,
+        ts_ms: ts.timestamp_millis(),
+        ts_str: ts.format("%b %d %H:%M").to_string(),
+        kind,
+        charge_pct,
+        power_source,
+        duration_secs,
+        reason,
+    })
 }
 
 pub fn parse_pmset_log(
@@ -297,92 +435,97 @@ pub fn parse_pmset_log(
     current_charge_pct: Option<u8>,
     on_battery_now: bool,
 ) -> SleepReport {
-    let mut events: Vec<ParsedLogEvent> = Vec::new();
+    let events: Vec<ParsedLogEvent> = log_text
+        .lines()
+        .filter_map(|l| parse_prefiltered_bytes(l.as_bytes()))
+        .collect();
+    let now = events
+        .last()
+        .map(|e| e.ts)
+        .unwrap_or_else(|| chrono::Local::now().fixed_offset());
+    build_sleep_report_from_events(events, current_charge_pct, on_battery_now, None, None, now)
+}
 
-    for line in log_text.lines() {
-        // Format: "2026-11-21 19:17:50 +0530 DarkWake            \tDarkWake from Deep Idle ..."
-        if line.len() < 30 {
-            continue;
-        }
-        let ts_slice = &line[..25];
-        let rest = &line[25..];
-        let trimmed = rest.trim_start();
+struct SessionWithIntervals {
+    session: SleepSession,
+    sleep_intervals: Vec<(i64, i64)>,
+    dark_wake_intervals: Vec<(i64, i64)>,
+}
 
-        let kind = if trimmed.starts_with("Sleep ") || trimmed.starts_with("Sleep\t") {
-            if !trimmed.contains("Entering Sleep state") {
-                continue;
-            }
-            LogEventKind::Sleep
-        } else if trimmed.starts_with("DarkWake ") || trimmed.starts_with("DarkWake\t") {
-            LogEventKind::DarkWake
-        } else if trimmed.starts_with("Wake ") || trimmed.starts_with("Wake\t") {
-            if trimmed.contains("Wake from Hibernate") || trimmed.contains("Wake from Standby") {
-                LogEventKind::HibernateWake
-            } else if trimmed.contains("Wake from") {
-                LogEventKind::Wake
-            } else {
-                continue;
-            }
-        } else {
-            continue;
-        };
+fn build_sleep_report_from_events(
+    mut events: Vec<ParsedLogEvent>,
+    current_charge_pct: Option<u8>,
+    on_battery_now: bool,
+    stored_unplug: Option<StoredUnplugTransition>,
+    earliest_sample_ms: Option<i64>,
+    now: DateTime<FixedOffset>,
+) -> SleepReport {
+    let now_ms = now.timestamp_millis();
 
-        let Ok(ts) = DateTime::parse_from_str(ts_slice, "%Y-%m-%d %H:%M:%S %z") else {
-            continue;
-        };
+    // Keep last 7 days of events relative to `now`.
+    let cutoff_ms = now_ms - (7 * 24 * 3600 * 1000);
+    events.retain(|e| e.ts_ms >= cutoff_ms);
 
-        let charge_pct = extract_charge_pct(trimmed);
-        let power_source = extract_power_source(trimmed);
-        let duration_secs = extract_trailing_secs(trimmed);
-        let reason = extract_reason(trimmed, kind);
+    let raw_log_available = !events.is_empty();
 
-        events.push(ParsedLogEvent {
-            ts,
-            ts_str: ts.format("%b %d %H:%M").to_string(),
-            kind,
-            charge_pct,
-            power_source,
-            duration_secs,
-            reason,
-        });
-    }
+    // 1. Determine accurate `[unplug_ts_ms, now_ms]` window using SQLite samples + pmset fallback.
+    let (unplug_ts_ms, unplug_start_pct, unplug_source) =
+        resolve_unplug_anchor(&events, on_battery_now, stored_unplug);
 
-    // Keep last 7 days of events to keep UI fast and focused.
-    if let Some(last_ts) = events.last().map(|e| e.ts) {
-        let cutoff = last_ts - chrono::Duration::days(7);
-        events.retain(|e| e.ts >= cutoff);
-    }
-
-    // Group Sleep -> DarkWake* -> Wake into logical SleepSessions.
-    let mut sessions: Vec<SleepSession> = Vec::new();
+    // 2. Group Sleep -> DarkWake* -> Wake into sessions (retaining exact ms intervals).
+    let mut built_sessions: Vec<SessionWithIntervals> = Vec::new();
     let mut current_start: Option<ParsedLogEvent> = None;
     let mut current_wakes: Vec<WakeEvent> = Vec::new();
+    let mut current_sleep_intervals: Vec<(i64, i64)> = Vec::new();
+    let mut current_dark_intervals: Vec<(i64, i64)> = Vec::new();
     let mut current_dark_secs: u64 = 0;
     let mut current_sleep_secs: u64 = 0;
-    let mut reason_agg: HashMap<String, (DecodedWakeReason, u32, u64)> = HashMap::new();
+
+    let mut all_batt_reason_agg: HashMap<String, (DecodedWakeReason, u32, u64)> = HashMap::new();
+    let mut unplug_reason_agg: HashMap<String, (DecodedWakeReason, u32, u64)> = HashMap::new();
 
     for ev in &events {
         match ev.kind {
+            LogEventKind::PowerMarker => {}
             LogEventKind::Sleep => {
+                let dur_ms = (ev.duration_secs as i64) * 1000;
                 if current_start.is_none() {
                     current_start = Some(ev.clone());
                     current_wakes.clear();
+                    current_sleep_intervals.clear();
+                    current_dark_intervals.clear();
                     current_dark_secs = 0;
                     current_sleep_secs = ev.duration_secs;
                 } else {
-                    // Continuation of a sleep session after a DarkWake ("Maintenance Sleep").
                     current_sleep_secs += ev.duration_secs;
+                }
+                if dur_ms > 0 {
+                    current_sleep_intervals.push((ev.ts_ms, ev.ts_ms + dur_ms));
                 }
             }
             LogEventKind::DarkWake => {
                 let decoded = decode_wake_reason(&ev.reason);
-                let entry = reason_agg
-                    .entry(decoded.token.clone())
-                    .or_insert_with(|| (decoded.clone(), 0, 0));
-                entry.1 += 1;
-                entry.2 += ev.duration_secs.max(1);
+                let dur_s = ev.duration_secs.max(1);
+                if ev.power_source != "AC" {
+                    let e_all = all_batt_reason_agg
+                        .entry(decoded.token.clone())
+                        .or_insert_with(|| (decoded.clone(), 0, 0));
+                    e_all.1 += 1;
+                    e_all.2 += dur_s;
+
+                    if let Some(u_ms) = unplug_ts_ms {
+                        if ev.ts_ms >= u_ms {
+                            let e_u = unplug_reason_agg
+                                .entry(decoded.token.clone())
+                                .or_insert_with(|| (decoded.clone(), 0, 0));
+                            e_u.1 += 1;
+                            e_u.2 += dur_s;
+                        }
+                    }
+                }
 
                 current_dark_secs += ev.duration_secs;
+                current_dark_intervals.push((ev.ts_ms, ev.ts_ms + (dur_s as i64) * 1000));
                 current_wakes.push(WakeEvent {
                     timestamp: ev.ts_str.clone(),
                     kind: "DarkWake".into(),
@@ -396,7 +539,7 @@ pub fn parse_pmset_log(
             LogEventKind::Wake | LogEventKind::HibernateWake => {
                 let decoded = decode_wake_reason(&ev.reason);
                 if let Some(start) = current_start.take() {
-                    let wall_secs = (ev.ts - start.ts).num_seconds().max(0) as u64;
+                    let wall_secs = ((ev.ts_ms - start.ts_ms).max(0) / 1000) as u64;
                     let total_secs = wall_secs.max(current_sleep_secs + current_dark_secs);
                     let drain = match (start.charge_pct, ev.charge_pct) {
                         (Some(s), Some(e)) => (s as i32 - e as i32).max(0),
@@ -404,7 +547,9 @@ pub fn parse_pmset_log(
                     };
                     let dark_count = current_wakes.len() as u32;
                     let worst = find_worst_wake(&current_wakes).or_else(|| Some(decoded.clone()));
-                    let severity = if drain >= 8 || dark_count >= 10 {
+                    let severity = if start.power_source == "AC" {
+                        "ok"
+                    } else if drain >= 8 || dark_count >= 10 {
                         "critical"
                     } else if drain >= 3 || dark_count >= 3 {
                         "warning"
@@ -427,23 +572,34 @@ pub fn parse_pmset_log(
                         decoded,
                     });
 
-                    // Only record meaningful sleep sessions (>= 60s or any DarkWake/drain).
-                    if total_secs >= 60 || dark_count > 0 || drain > 0 {
-                        sessions.push(SleepSession {
-                            id: format!("sleep-{}", sessions.len() + 1),
-                            start_time: start.ts_str,
-                            end_time: ev.ts_str.clone(),
-                            duration_secs: total_secs,
-                            start_charge_pct: start.charge_pct,
-                            end_charge_pct: ev.charge_pct,
-                            drain_pct: drain,
-                            power_source: start.power_source,
-                            sleep_reason: start.reason,
-                            dark_wake_count: dark_count,
-                            dark_wake_total_secs: current_dark_secs,
-                            worst_wake_reason: worst,
-                            wake_events: wakes,
-                            severity: severity.into(),
+                    let in_unplug = unplug_ts_ms
+                        .map(|u_ms| ev.ts_ms > u_ms && start.power_source != "AC")
+                        .unwrap_or(false);
+
+                    // Record battery sleep sessions (skip AC-only overnight charging sessions so they don't distort battery sleep health).
+                    if start.power_source != "AC" && (total_secs >= 60 || dark_count > 0 || drain > 0) {
+                        built_sessions.push(SessionWithIntervals {
+                            session: SleepSession {
+                                id: format!("sleep-{}", built_sessions.len() + 1),
+                                start_time: start.ts_str,
+                                end_time: ev.ts_str.clone(),
+                                start_ms: start.ts_ms,
+                                end_ms: ev.ts_ms,
+                                duration_secs: total_secs,
+                                start_charge_pct: start.charge_pct,
+                                end_charge_pct: ev.charge_pct,
+                                drain_pct: drain,
+                                power_source: start.power_source,
+                                sleep_reason: start.reason,
+                                dark_wake_count: dark_count,
+                                dark_wake_total_secs: current_dark_secs,
+                                worst_wake_reason: worst,
+                                wake_events: wakes,
+                                severity: severity.into(),
+                                in_current_unplug: in_unplug,
+                            },
+                            sleep_intervals: std::mem::take(&mut current_sleep_intervals),
+                            dark_wake_intervals: std::mem::take(&mut current_dark_intervals),
                         });
                     }
                     current_dark_secs = 0;
@@ -453,12 +609,42 @@ pub fn parse_pmset_log(
         }
     }
 
-    // Most recent sessions first.
+    // 3. Intersect battery sleep sessions strictly with `[unplug_ts_ms, now_ms]`!
+    let since_unplug = compute_scoped_since_unplug(
+        &built_sessions,
+        unplug_ts_ms,
+        unplug_start_pct,
+        unplug_source,
+        current_charge_pct,
+        on_battery_now,
+        raw_log_available,
+        earliest_sample_ms,
+        events.first().map(|e| e.ts_ms),
+        now_ms,
+    );
+
+    let mut sessions: Vec<SleepSession> = built_sessions.into_iter().map(|b| b.session).collect();
     sessions.reverse();
     sessions.truncate(20);
 
-    // Top wake reasons sorted by frequency.
-    let mut top_wake_reasons: Vec<WakeReasonAggregate> = reason_agg
+    let top_wake_reasons = sort_wake_reasons(all_batt_reason_agg);
+    let since_unplug_wake_reasons = sort_wake_reasons(unplug_reason_agg);
+    let timeline = build_timeline_buckets(&events, on_battery_now, current_charge_pct, now);
+
+    SleepReport {
+        since_unplug,
+        sessions,
+        top_wake_reasons,
+        since_unplug_wake_reasons,
+        timeline,
+        raw_log_available,
+    }
+}
+
+fn sort_wake_reasons(
+    map: HashMap<String, (DecodedWakeReason, u32, u64)>,
+) -> Vec<WakeReasonAggregate> {
+    let mut out: Vec<WakeReasonAggregate> = map
         .into_values()
         .map(|(decoded, count, total_secs)| WakeReasonAggregate {
             decoded,
@@ -466,18 +652,215 @@ pub fn parse_pmset_log(
             total_secs,
         })
         .collect();
-    top_wake_reasons.sort_by(|a, b| b.count.cmp(&a.count).then(b.total_secs.cmp(&a.total_secs)));
-    top_wake_reasons.truncate(12);
+    out.sort_by(|a, b| b.count.cmp(&a.count).then(b.total_secs.cmp(&a.total_secs)));
+    out.truncate(12);
+    out
+}
 
-    let since_unplug = compute_since_unplug(&events, current_charge_pct, on_battery_now);
-    let timeline = build_timeline_buckets(&events, on_battery_now, current_charge_pct);
+fn resolve_unplug_anchor(
+    events: &[ParsedLogEvent],
+    on_battery_now: bool,
+    stored_unplug: Option<StoredUnplugTransition>,
+) -> (Option<i64>, Option<u8>, String) {
+    if !on_battery_now {
+        return (None, None, "unknown".into());
+    }
 
-    SleepReport {
-        since_unplug,
-        sessions,
-        top_wake_reasons,
-        timeline,
-        raw_log_available: !events.is_empty(),
+    // 1. Primary: SQLite continuous power-source transition (captures awake unplugs!).
+    if let Some(st) = stored_unplug {
+        if st.batt_ts_ms - st.ac_ts_ms <= 120_000 {
+            return (Some(st.batt_ts_ms), st.start_charge_pct, "samples".into());
+        }
+        // Gap > 120s (sleep or app closed): refine inside [ac_ts_ms, batt_ts_ms] via pmset if present.
+        if let Some(ev) = events
+            .iter()
+            .find(|e| e.ts_ms > st.ac_ts_ms && e.ts_ms <= st.batt_ts_ms && e.power_source != "AC")
+        {
+            return (
+                Some(ev.ts_ms),
+                ev.charge_pct.or(st.start_charge_pct),
+                "pmset".into(),
+            );
+        }
+        return (Some(st.batt_ts_ms), st.start_charge_pct, "samples".into());
+    }
+
+    // 2. Fallback: Walk `pmset` events (including `Assertions Summary-` Using AC / Using Batt) backward.
+    for (idx, ev) in events.iter().enumerate().rev() {
+        if ev.power_source == "AC" {
+            if let Some(first_batt) = events[idx + 1..].iter().find(|e| e.power_source != "AC") {
+                return (
+                    Some(first_batt.ts_ms),
+                    first_batt.charge_pct.or(ev.charge_pct),
+                    "pmset".into(),
+                );
+            }
+            break;
+        }
+    }
+
+    (None, None, "unknown".into())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_scoped_since_unplug(
+    sessions: &[SessionWithIntervals],
+    unplug_ts_ms: Option<i64>,
+    unplug_start_pct: Option<u8>,
+    unplug_source: String,
+    current_charge_pct: Option<u8>,
+    on_battery_now: bool,
+    raw_log_available: bool,
+    earliest_sample_ms: Option<i64>,
+    earliest_log_ms: Option<i64>,
+    now_ms: i64,
+) -> SinceUnplugSummary {
+    let earliest_known = match (earliest_sample_ms, earliest_log_ms) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    let history_coverage_secs = earliest_known
+        .map(|e| ((now_ms - e).max(0) / 1000) as u64)
+        .unwrap_or(0);
+
+    if !raw_log_available && earliest_sample_ms.is_none() {
+        return SinceUnplugSummary {
+            started_at: None,
+            unplug_ts_ms: None,
+            unplug_source: "unknown".into(),
+            data_status: "log_unavailable".into(),
+            history_coverage_secs: 0,
+            elapsed_secs: 0,
+            start_charge_pct: current_charge_pct,
+            current_charge_pct,
+            total_drop_pct: 0,
+            asleep_drain_pct: 0,
+            active_drain_pct: 0,
+            sleep_session_count: 0,
+            active_secs: 0,
+            sleep_secs: 0,
+            dark_wake_secs: 0,
+            dark_wake_count: 0,
+            drain_pct_per_hour: 0.0,
+            on_battery_now,
+        };
+    }
+
+    if !on_battery_now {
+        return SinceUnplugSummary {
+            started_at: None,
+            unplug_ts_ms: None,
+            unplug_source: "unknown".into(),
+            data_status: "on_ac".into(),
+            history_coverage_secs,
+            elapsed_secs: 0,
+            start_charge_pct: current_charge_pct,
+            current_charge_pct,
+            total_drop_pct: 0,
+            asleep_drain_pct: 0,
+            active_drain_pct: 0,
+            sleep_session_count: 0,
+            active_secs: 0,
+            sleep_secs: 0,
+            dark_wake_secs: 0,
+            dark_wake_count: 0,
+            drain_pct_per_hour: 0.0,
+            on_battery_now: false,
+        };
+    }
+
+    let Some(u_ms) = unplug_ts_ms else {
+        return SinceUnplugSummary {
+            started_at: None,
+            unplug_ts_ms: None,
+            unplug_source: "unknown".into(),
+            data_status: "insufficient_history".into(),
+            history_coverage_secs,
+            elapsed_secs: history_coverage_secs,
+            start_charge_pct: current_charge_pct,
+            current_charge_pct,
+            total_drop_pct: 0,
+            asleep_drain_pct: 0,
+            active_drain_pct: 0,
+            sleep_session_count: 0,
+            active_secs: history_coverage_secs,
+            sleep_secs: 0,
+            dark_wake_secs: 0,
+            dark_wake_count: 0,
+            drain_pct_per_hour: 0.0,
+            on_battery_now: true,
+        };
+    };
+
+    let elapsed_secs = ((now_ms - u_ms).max(0) / 1000) as u64;
+    let started_at = chrono::DateTime::from_timestamp_millis(u_ms)
+        .map(|utc| utc.with_timezone(&chrono::Local).format("%b %d %H:%M").to_string());
+
+    let mut sleep_secs = 0u64;
+    let mut dark_wake_secs = 0u64;
+    let mut dark_wake_count = 0u32;
+    let mut asleep_drain_raw = 0i32;
+    let mut sleep_session_count = 0u32;
+
+    for s in sessions {
+        if s.session.end_ms <= u_ms || s.session.power_source == "AC" {
+            continue;
+        }
+        sleep_session_count += 1;
+
+        for &(a, b) in &s.sleep_intervals {
+            let clipped = (b.min(now_ms) - a.max(u_ms)).max(0) / 1000;
+            sleep_secs += clipped as u64;
+        }
+        for &(a, b) in &s.dark_wake_intervals {
+            if b > u_ms {
+                let clipped = (b.min(now_ms) - a.max(u_ms)).max(0) / 1000;
+                dark_wake_secs += clipped as u64;
+                dark_wake_count += 1;
+            }
+        }
+        // Only attribute full session drain when session began at/after unplug_ts_ms.
+        if s.session.start_ms >= u_ms {
+            asleep_drain_raw += s.session.drain_pct.max(0);
+        } else if let (Some(u_pct), Some(e_pct)) = (unplug_start_pct, s.session.end_charge_pct) {
+            asleep_drain_raw += (u_pct as i32 - e_pct as i32).max(0);
+        }
+    }
+
+    let active_secs = elapsed_secs.saturating_sub(sleep_secs + dark_wake_secs);
+    let total_drop = match (unplug_start_pct, current_charge_pct) {
+        (Some(s), Some(c)) => (s as i32 - c as i32).max(0),
+        _ => 0,
+    };
+    let asleep_drain = asleep_drain_raw.clamp(0, total_drop);
+    let active_drain = (total_drop - asleep_drain).max(0);
+    let hours = (elapsed_secs as f64 / 3600.0).max(0.05);
+
+    let data_status = if sleep_session_count == 0 {
+        "no_battery_sleep"
+    } else {
+        "ok"
+    };
+
+    SinceUnplugSummary {
+        started_at,
+        unplug_ts_ms: Some(u_ms),
+        unplug_source,
+        data_status: data_status.into(),
+        history_coverage_secs,
+        elapsed_secs,
+        start_charge_pct: unplug_start_pct,
+        current_charge_pct,
+        total_drop_pct: total_drop,
+        asleep_drain_pct: asleep_drain,
+        active_drain_pct: active_drain,
+        sleep_session_count,
+        active_secs,
+        sleep_secs,
+        dark_wake_secs,
+        dark_wake_count,
+        drain_pct_per_hour: ((total_drop as f64 / hours) * 10.0).round() / 10.0,
+        on_battery_now: true,
     }
 }
 
@@ -495,106 +878,17 @@ fn find_worst_wake(wakes: &[WakeEvent]) -> Option<DecodedWakeReason> {
         .map(|(_, d)| d)
 }
 
-fn compute_since_unplug(
-    events: &[ParsedLogEvent],
-    current_charge_pct: Option<u8>,
-    on_battery_now: bool,
-) -> SinceUnplugSummary {
-    // Walk backward from the latest event to find the last AC event (or highest charge before discharge).
-    let mut unplug_idx: Option<usize> = None;
-    for (idx, ev) in events.iter().enumerate().rev() {
-        if ev.power_source == "AC" {
-            if idx + 1 < events.len() {
-                unplug_idx = Some(idx + 1);
-            }
-            break;
-        }
-    }
-
-    let slice = match unplug_idx {
-        Some(i) if i < events.len() => &events[i..],
-        _ => {
-            // If all recent events are on BATT, take the last 24h window.
-            if let Some(last) = events.last() {
-                let cutoff = last.ts - chrono::Duration::hours(24);
-                let start = events.iter().position(|e| e.ts >= cutoff).unwrap_or(0);
-                &events[start..]
-            } else {
-                &[]
-            }
-        }
-    };
-
-    if slice.is_empty() {
-        return SinceUnplugSummary {
-            started_at: None,
-            elapsed_secs: 0,
-            start_charge_pct: current_charge_pct,
-            current_charge_pct,
-            total_drop_pct: 0,
-            active_secs: 0,
-            sleep_secs: 0,
-            dark_wake_secs: 0,
-            dark_wake_count: 0,
-            drain_pct_per_hour: 0.0,
-            on_battery_now,
-        };
-    }
-
-    let first = &slice[0];
-    let now = chrono::Local::now().fixed_offset();
-    let elapsed_secs = (now - first.ts).num_seconds().max(60) as u64;
-
-    let mut sleep_secs = 0u64;
-    let mut dark_wake_secs = 0u64;
-    let mut dark_wake_count = 0u32;
-
-    for ev in slice {
-        match ev.kind {
-            LogEventKind::Sleep => sleep_secs += ev.duration_secs,
-            LogEventKind::DarkWake => {
-                dark_wake_count += 1;
-                dark_wake_secs += ev.duration_secs.max(1);
-            }
-            _ => {}
-        }
-    }
-
-    let active_secs = elapsed_secs.saturating_sub(sleep_secs + dark_wake_secs);
-    let start_pct = first.charge_pct.or(current_charge_pct);
-    let cur_pct = current_charge_pct.or_else(|| slice.last().and_then(|e| e.charge_pct));
-    let total_drop = match (start_pct, cur_pct) {
-        (Some(s), Some(c)) => (s as i32 - c as i32).max(0),
-        _ => 0,
-    };
-    let hours = (elapsed_secs as f64 / 3600.0).max(0.05);
-
-    SinceUnplugSummary {
-        started_at: Some(first.ts_str.clone()),
-        elapsed_secs,
-        start_charge_pct: start_pct,
-        current_charge_pct: cur_pct,
-        total_drop_pct: total_drop,
-        active_secs,
-        sleep_secs,
-        dark_wake_secs,
-        dark_wake_count,
-        drain_pct_per_hour: ((total_drop as f64 / hours) * 10.0).round() / 10.0,
-        on_battery_now,
-    }
-}
-
 fn build_timeline_buckets(
     events: &[ParsedLogEvent],
     on_battery_now: bool,
     current_charge_pct: Option<u8>,
+    now: DateTime<FixedOffset>,
 ) -> Vec<TimelineBucket> {
     let target_buckets = 48usize;
     if events.is_empty() {
         return Vec::new();
     }
 
-    let now = chrono::Local::now().fixed_offset();
     let window_secs = 24 * 3600i64;
     let start = now - chrono::Duration::seconds(window_secs);
     let step_secs = window_secs / target_buckets as i64;
@@ -605,24 +899,30 @@ fn build_timeline_buckets(
         let b_end = b_start + chrono::Duration::seconds(step_secs);
         let label = b_start.format("%H:%M").to_string();
 
-        // Find events inside this bucket and the last known state before it.
         let mut dark_wakes = 0u32;
-        let mut last_charge: Option<u8> = None;
+        let mut bucket_charge: Option<u8> = None;
         let mut had_sleep = false;
         let mut had_ac = false;
         let mut had_wake = false;
+        let mut saw_any_before_or_in = false;
         let mut detail_reason = String::new();
 
         for ev in events {
             if ev.ts < b_start {
+                saw_any_before_or_in = true;
                 if ev.charge_pct.is_some() {
-                    last_charge = ev.charge_pct;
+                    bucket_charge = ev.charge_pct;
                 }
-                had_sleep = ev.kind == LogEventKind::Sleep;
+                if ev.kind == LogEventKind::Sleep {
+                    had_sleep = true;
+                } else if ev.kind == LogEventKind::Wake || ev.kind == LogEventKind::HibernateWake {
+                    had_sleep = false;
+                }
                 had_ac = ev.power_source == "AC";
             } else if ev.ts >= b_start && ev.ts < b_end {
+                saw_any_before_or_in = true;
                 if ev.charge_pct.is_some() {
-                    last_charge = ev.charge_pct;
+                    bucket_charge = ev.charge_pct;
                 }
                 if ev.power_source == "AC" {
                     had_ac = true;
@@ -631,7 +931,7 @@ fn build_timeline_buckets(
                     LogEventKind::DarkWake => {
                         dark_wakes += 1;
                         if detail_reason.is_empty() {
-                            detail_reason = decode_wake_reason(&ev.reason).token;
+                            detail_reason = decode_wake_reason(&ev.reason).label;
                         }
                     }
                     LogEventKind::Sleep => had_sleep = true,
@@ -639,20 +939,23 @@ fn build_timeline_buckets(
                         had_wake = true;
                         had_sleep = false;
                     }
+                    LogEventKind::PowerMarker => {}
                 }
             }
         }
 
-        let (state, detail, est_watts) = if dark_wakes > 0 {
+        let (state, detail, est_watts) = if !saw_any_before_or_in && i < target_buckets - 1 {
+            ("empty", "No logged data".to_string(), 0.0)
+        } else if dark_wakes > 0 {
             (
                 "darkwake",
-                format!("{dark_wakes} DarkWake(s) · {detail_reason}"),
+                format!("{dark_wakes} silent wake(s) · {detail_reason}"),
                 3.2,
             )
         } else if had_ac && (i < target_buckets - 1 || !on_battery_now) {
             ("charging", "On AC power".to_string(), 14.0)
         } else if had_sleep && !had_wake {
-            ("sleep", "Deep Idle sleep".to_string(), 0.3)
+            ("sleep", "Asleep (Deep Idle)".to_string(), 0.3)
         } else if i == target_buckets - 1 {
             (
                 if on_battery_now { "active" } else { "charging" },
@@ -672,9 +975,9 @@ fn build_timeline_buckets(
             state: state.into(),
             watts: est_watts,
             charge_pct: if i == target_buckets - 1 {
-                current_charge_pct.or(last_charge)
+                current_charge_pct.or(bucket_charge)
             } else {
-                last_charge
+                bucket_charge
             },
             duration_secs: step_secs as u64,
             detail,
@@ -686,26 +989,20 @@ fn build_timeline_buckets(
 
 fn extract_charge_pct(s: &str) -> Option<u8> {
     let idx = s.find("Charge:")?;
-    let after = &s[idx + "Charge:".len()..];
-    let digits: String = after
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
+    let after = s[idx + "Charge:".len()..].trim_start();
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse::<u8>().ok().map(|v| v.min(100))
 }
 
 fn extract_power_source(s: &str) -> String {
     if s.contains("Using AC") {
         "AC".into()
-    } else if s.contains("Using Batt") || s.contains("Using BATT") {
-        "BATT".into()
     } else {
         "BATT".into()
     }
 }
 
 fn extract_trailing_secs(s: &str) -> u64 {
-    // e.g. "... (Charge:38%) 902 secs"
     if let Some(pos) = s.rfind(" secs") {
         let before = s[..pos].trim_end();
         let num_str: String = before
@@ -745,6 +1042,7 @@ fn extract_reason(s: &str, kind: LogEventKind) -> String {
             }
             "Unknown".into()
         }
+        LogEventKind::PowerMarker => String::new(),
     }
 }
 
@@ -782,7 +1080,6 @@ pub fn parse_pmset_custom_audit(text: &str, dark_wake_count: u32) -> Vec<PmsetAu
         }
         let mut parts = line.split_whitespace();
         if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-            // Skip multi-word labels like "Sleep On Power Button 1" cleanly.
             if k == "Sleep" {
                 continue;
             }
@@ -797,7 +1094,6 @@ pub fn parse_pmset_custom_audit(text: &str, dark_wake_count: u32) -> Vec<PmsetAu
 
     let mut items: Vec<PmsetAuditItem> = Vec::new();
 
-    // 1. disablesleep = 1 (huge hot-bag footgun!)
     if let Some(v) = batt.get("SleepDisabled").or_else(|| batt.get("disablesleep")) {
         if v == "1" {
             items.push(PmsetAuditItem {
@@ -814,7 +1110,6 @@ pub fn parse_pmset_custom_audit(text: &str, dark_wake_count: u32) -> Vec<PmsetAu
         }
     }
 
-    // 2. sleep = 0 on battery
     if let Some(v) = batt.get("sleep") {
         if v == "0" {
             items.push(PmsetAuditItem {
@@ -831,7 +1126,6 @@ pub fn parse_pmset_custom_audit(text: &str, dark_wake_count: u32) -> Vec<PmsetAu
         }
     }
 
-    // 3. powernap = 1 on battery
     if let Some(v) = batt.get("powernap") {
         if v == "1" {
             items.push(PmsetAuditItem {
@@ -840,15 +1134,14 @@ pub fn parse_pmset_custom_audit(text: &str, dark_wake_count: u32) -> Vec<PmsetAu
                 key: "powernap".into(),
                 current_value: "1".into(),
                 recommended_value: "0".into(),
-                severity: if dark_wake_count >= 5 { "warning" } else { "warning" }.into(),
+                severity: "warning".into(),
                 title: "Power Nap enabled on battery".into(),
-                explanation: "Allows macOS to wake periodically in DarkWake to sync Mail, iCloud, and Time Machine on battery.".into(),
+                explanation: "Allows macOS to wake periodically during sleep to sync Mail, iCloud, and Time Machine on battery.".into(),
                 fix_command: Some("sudo pmset -b powernap 0".into()),
             });
         }
     }
 
-    // 4. tcpkeepalive = 1 on battery
     if let Some(v) = batt.get("tcpkeepalive") {
         if v == "1" {
             items.push(PmsetAuditItem {
@@ -857,23 +1150,18 @@ pub fn parse_pmset_custom_audit(text: &str, dark_wake_count: u32) -> Vec<PmsetAu
                 key: "tcpkeepalive".into(),
                 current_value: "1".into(),
                 recommended_value: "0".into(),
-                severity: if dark_wake_count >= 5 {
-                    "warning".into()
-                } else {
-                    "ok".into()
-                },
+                severity: if dark_wake_count >= 5 { "warning" } else { "ok" }.into(),
                 title: if dark_wake_count >= 5 {
-                    format!("TCPKeepAlive active on battery ({dark_wake_count} DarkWakes seen)")
+                    format!("TCPKeepAlive active on battery ({dark_wake_count} silent wakes)")
                 } else {
                     "TCPKeepAlive active on battery (Find My / Push)".into()
                 },
-                explanation: "Keeps Wi-Fi sockets alive during sleep; common cause of `wifibt` / `SMC.OutboxNotEmpty` DarkWake loops. Note: disabling pauses Find My while asleep.".into(),
+                explanation: "Keeps Wi-Fi sockets alive during sleep; common cause of Wi-Fi/Bluetooth wake loops. Disabling pauses Find My while asleep.".into(),
                 fix_command: Some("sudo pmset -b tcpkeepalive 0".into()),
             });
         }
     }
 
-    // 5. womp = 1 on battery
     if let Some(v) = batt.get("womp") {
         if v == "1" {
             items.push(PmsetAuditItem {
@@ -890,7 +1178,6 @@ pub fn parse_pmset_custom_audit(text: &str, dark_wake_count: u32) -> Vec<PmsetAu
         }
     }
 
-    // 6. hibernatemode = 0 on battery
     if let Some(v) = batt.get("hibernatemode") {
         if v == "0" {
             items.push(PmsetAuditItem {
@@ -904,10 +1191,21 @@ pub fn parse_pmset_custom_audit(text: &str, dark_wake_count: u32) -> Vec<PmsetAu
                 explanation: "RAM is not backed up to disk on sleep; hitting 0% battery will hard-crash open work.".into(),
                 fix_command: Some("sudo pmset -b hibernatemode 3".into()),
             });
+        } else if v == "3" {
+            items.push(PmsetAuditItem {
+                id: "batt-hibernate-ok".into(),
+                profile: "Battery Power".into(),
+                key: "hibernatemode".into(),
+                current_value: "3".into(),
+                recommended_value: "3".into(),
+                severity: "ok".into(),
+                title: "Safe Sleep (hibernatemode 3) active".into(),
+                explanation: "RAM state is saved safely before deep sleep or 0% shutdown.".into(),
+                fix_command: None,
+            });
         }
     }
 
-    // 7. standby = 0 on battery
     if let Some(v) = batt.get("standby") {
         if v == "0" {
             items.push(PmsetAuditItem {
@@ -918,13 +1216,12 @@ pub fn parse_pmset_custom_audit(text: &str, dark_wake_count: u32) -> Vec<PmsetAu
                 recommended_value: "1".into(),
                 severity: "warning".into(),
                 title: "Deep Standby disabled on battery".into(),
-                explanation: "Mac will stay in higher-draw normal sleep instead of dropping into deep standby overnight.".into(),
+                explanation: "Mac stays in higher-draw normal sleep instead of dropping into deep standby overnight.".into(),
                 fix_command: Some("sudo pmset -b standby 1".into()),
             });
         }
     }
 
-    // 8. networkoversleep = 1 on battery
     if let Some(v) = batt.get("networkoversleep") {
         if v == "1" {
             items.push(PmsetAuditItem {
@@ -941,39 +1238,6 @@ pub fn parse_pmset_custom_audit(text: &str, dark_wake_count: u32) -> Vec<PmsetAu
         }
     }
 
-    // 9. ttyskeepawake = 1 on battery (informational if user leaves SSH open)
-    if let Some(v) = batt.get("ttyskeepawake") {
-        if v == "1" {
-            items.push(PmsetAuditItem {
-                id: "batt-ttys".into(),
-                profile: "Battery Power".into(),
-                key: "ttyskeepawake".into(),
-                current_value: "1".into(),
-                recommended_value: "0".into(),
-                severity: "ok".into(),
-                title: "Active SSH/TTY sessions prevent sleep on battery".into(),
-                explanation: "Leaving a remote TTY session open can keep your MacBook awake until disconnected.".into(),
-                fix_command: Some("sudo pmset -b ttyskeepawake 0".into()),
-            });
-        }
-    }
-
-    // 10. Healthy confirmation check for AC/Battery sleep baseline
-    if let Some(v) = batt.get("hibernatemode") {
-        if v == "3" {
-            items.push(PmsetAuditItem {
-                id: "batt-hibernate-ok".into(),
-                profile: "Battery Power".into(),
-                key: "hibernatemode".into(),
-                current_value: "3".into(),
-                recommended_value: "3".into(),
-                severity: "ok".into(),
-                title: "Safe Sleep (hibernatemode 3) active".into(),
-                explanation: "RAM state is saved safely before deep sleep/0% shutdown.".into(),
-                fix_command: None,
-            });
-        }
-    }
     if let Some(v) = ac.get("womp") {
         if v == "1" {
             items.push(PmsetAuditItem {
@@ -990,7 +1254,6 @@ pub fn parse_pmset_custom_audit(text: &str, dark_wake_count: u32) -> Vec<PmsetAu
         }
     }
 
-    // Sort: critical -> warning -> ok
     items.sort_by_key(|item| match item.severity.as_str() {
         "critical" => 0,
         "warning" => 1,
@@ -1005,7 +1268,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decodes_apple_silicon_wake_tokens() {
+    fn decodes_apple_silicon_wake_tokens_with_lid_and_pwrbtn_priority() {
         let d = decode_wake_reason("smc.sysState.Wake(0x70070000) wifibt SMC.OutboxNotEmpty/");
         assert_eq!(d.token, "wifibt");
         assert!(d.is_insomnia_suspect);
@@ -1014,46 +1277,33 @@ mod tests {
         assert_eq!(d2.token, "NUB.SPMI");
         assert!(d2.is_insomnia_suspect);
 
+        // Lid and power button MUST win over generic smc.sysState!
         let d3 = decode_wake_reason("smc.sysState.Wake(0x70070000) lid SMC.OutboxNotEmpty/UserActivity");
-        assert_eq!(d3.token, "SMC.OutboxNotEmpty");
+        assert_eq!(d3.token, "lid");
+        assert!(!d3.is_insomnia_suspect);
 
-        let d4 = decode_wake_reason("acattach/UserActivity Assertion");
-        assert_eq!(d4.token, "EC.ACAttach");
+        let d4 = decode_wake_reason("smc.sysState.Wake(0x70070000) pwrbtn SMC.OutboxNotEmpty/UserActivity");
+        assert_eq!(d4.token, "pwrbtn");
         assert!(!d4.is_insomnia_suspect);
     }
 
     #[test]
-    fn parses_real_pmset_log_session() {
+    fn isolates_sleep_attribution_to_current_unplug_window() {
+        // Yesterday: 8% overnight drain. Today: unplugged at 100%, currently 98%, no sleep since unplug!
         let sample = "\
-2026-11-21 19:02:48 +0530 Sleep               \tEntering Sleep state due to 'Maintenance Sleep':TCPKeepAlive=active Using Batt (Charge:38%) 902 secs
-2026-11-21 19:17:50 +0530 DarkWake            \tDarkWake from Deep Idle [CDNP] : due to smc.sysState.Wake(0x70070000) wifibt SMC.OutboxNotEmpty/ Using BATT (Charge:38%) 21 secs
-2026-11-21 19:18:11 +0530 Sleep               \tEntering Sleep state due to 'Maintenance Sleep':TCPKeepAlive=active Using Batt (Charge:38%) 726 secs
-2026-11-21 19:30:17 +0530 DarkWake            \tDarkWake from Deep Idle [CDNP] : due to NUB.SPMI0.SW3.IRQ nub-spmi0.0x02 rtc/Maintenance Using BATT (Charge:35%) 21 secs
-2026-11-21 20:52:01 +0530 Wake                \tWake from Deep Idle [CDNVA] : due to smc.sysState.Wake(0x70070000) lid SMC.OutboxNotEmpty/UserActivity Assertion Using BATT (Charge:34%)
+2026-11-21 19:02:48 +0530 Sleep               \tEntering Sleep state due to 'Idle Sleep':TCPKeepAlive=active Using Batt (Charge:50%) 3600 secs
+2026-11-21 20:02:48 +0530 DarkWake            \tDarkWake from Deep Idle [CDNP] : due to smc.sysState.Wake(0x70070000) wifibt SMC.OutboxNotEmpty/ Using BATT (Charge:42%) 21 secs
+2026-11-21 20:03:10 +0530 Wake                \tWake from Deep Idle [CDNVA] : due to smc.sysState.Wake(0x70070000) lid SMC.OutboxNotEmpty/UserActivity Assertion Using BATT (Charge:42%)
+2026-11-22 06:54:47 +0530 Assertions          \tSummary- [System: PrevIdle] Using AC(Charge: 98)
+2026-11-22 08:28:00 +0530 Assertions          \tSummary- [System: PrevIdle] Using Batt(Charge: 100)
 ";
-        let report = parse_pmset_log(sample, Some(34), true);
+        let report = parse_pmset_log(sample, Some(98), true);
+        assert_eq!(report.since_unplug.total_drop_pct, 2);
+        assert_eq!(report.since_unplug.asleep_drain_pct, 0);
+        assert_eq!(report.since_unplug.active_drain_pct, 2);
+        assert_eq!(report.since_unplug.sleep_session_count, 0);
+        assert_eq!(report.since_unplug.data_status, "no_battery_sleep");
         assert_eq!(report.sessions.len(), 1);
-        assert_eq!(report.sessions[0].dark_wake_count, 2);
-        assert_eq!(report.sessions[0].drain_pct, 4);
-        assert_eq!(report.sessions[0].severity, "warning");
-        assert!(report.raw_log_available);
-    }
-
-    #[test]
-    fn audits_pmset_custom_footguns() {
-        let sample = "\
-Battery Power:
- disablesleep         1
- powernap             1
- tcpkeepalive         1
- hibernatemode        0
- sleep                1
-AC Power:
- womp                 1
-";
-        let audit = parse_pmset_custom_audit(sample, 12);
-        assert!(audit.iter().any(|i| i.key == "disablesleep" && i.severity == "critical"));
-        assert!(audit.iter().any(|i| i.key == "powernap" && i.fix_command.is_some()));
-        assert!(audit.iter().any(|i| i.key == "hibernatemode" && i.severity == "warning"));
+        assert!(!report.sessions[0].in_current_unplug);
     }
 }

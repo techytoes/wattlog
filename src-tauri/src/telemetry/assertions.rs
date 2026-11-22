@@ -1,7 +1,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::processes::{extract_app_name_from_path, is_system_protected_name, process_path_for_pid};
+use super::processes::{
+    extract_app_name_from_path, is_system_protected_name, process_path_for_pid,
+    process_start_time_for_pid,
+};
 use super::types::{KeepAwakeConfig, KeepAwakeState, PowerSnapshot, SleepBlocker};
 
 const WATTLOG_ASSERTION_TAG: &str = "Wattlog Keep-Awake";
@@ -22,6 +25,7 @@ pub fn collect_sleep_blockers() -> Vec<SleepBlocker> {
 /// Automatically kernel-released if the process exits or crashes.
 pub struct KeepAwakeManager {
     inner: Arc<Mutex<KeepAwakeInner>>,
+    demo_mode: bool,
 }
 
 struct KeepAwakeInner {
@@ -32,12 +36,15 @@ struct KeepAwakeInner {
     expires_at: Option<Instant>,
     last_auto_release_reason: Option<String>,
     watch_app_running: bool,
+    /// Prevents auto-re-enabling for the SAME app launch after manual Off, timer expiry, or guardrail release.
+    watch_suppressed_until_exit: bool,
     was_external_connected: Option<bool>,
 }
 
 impl KeepAwakeManager {
-    pub fn new() -> Self {
+    pub fn new(demo_mode: bool) -> Self {
         Self {
+            demo_mode,
             inner: Arc::new(Mutex::new(KeepAwakeInner {
                 config: KeepAwakeConfig::default(),
                 assertion_id: None,
@@ -46,6 +53,7 @@ impl KeepAwakeManager {
                 expires_at: None,
                 last_auto_release_reason: None,
                 watch_app_running: false,
+                watch_suppressed_until_exit: false,
                 was_external_connected: None,
             })),
         }
@@ -54,14 +62,19 @@ impl KeepAwakeManager {
     pub fn toggle_quick(&self, power: &PowerSnapshot) -> Result<KeepAwakeState, String> {
         let mut guard = self.inner.lock().map_err(|_| "lock poisoned".to_string())?;
         if guard.assertion_id.is_some() {
-            release_inner(&mut guard, None);
+            release_inner(&mut guard, None, self.demo_mode);
             guard.config.enabled = false;
+            // Suppress watch-app auto-restart until the watched app exits and relaunches.
+            if guard.config.watch_app_name.is_some() && guard.watch_app_running {
+                guard.watch_suppressed_until_exit = true;
+            }
             return Ok(build_state(&guard));
         }
 
+        guard.watch_suppressed_until_exit = false;
         let mut cfg = guard.config.clone();
         cfg.enabled = true;
-        apply_config_inner(&mut guard, cfg, power)
+        apply_config_inner(&mut guard, cfg, power, self.demo_mode)
     }
 
     pub fn apply_config(
@@ -70,56 +83,74 @@ impl KeepAwakeManager {
         power: &PowerSnapshot,
     ) -> Result<KeepAwakeState, String> {
         let mut guard = self.inner.lock().map_err(|_| "lock poisoned".to_string())?;
-        apply_config_inner(&mut guard, config, power)
+        // Explicit user config change re-arms watch-app trigger (or suppresses if user explicitly disabled).
+        if config.watch_app_name != guard.config.watch_app_name || config.enabled {
+            guard.watch_suppressed_until_exit = false;
+        } else if !config.enabled && config.watch_app_name.is_some() && guard.watch_app_running {
+            guard.watch_suppressed_until_exit = true;
+        }
+        apply_config_inner(&mut guard, config, power, self.demo_mode)
     }
 
-    /// Periodic guardrail check (called by background ticker & before snapshot).
-    pub fn enforce_guardrails(&self, power: &PowerSnapshot, running_apps: &[String]) -> KeepAwakeState {
+    /// Periodic guardrail check.
+    /// `running_apps`: pass `Some(&[...])` ONLY when processes were actually enumerated;
+    /// pass `None` on lightweight ticks so a watched app is NEVER falsely treated as exited!
+    pub fn enforce_guardrails(
+        &self,
+        power: &PowerSnapshot,
+        running_apps: Option<&[String]>,
+    ) -> KeepAwakeState {
         let Ok(mut guard) = self.inner.lock() else {
-            return KeepAwakeState {
-                active: false,
-                mode: "display".into(),
-                remaining_secs: None,
-                started_at_ms: None,
-                auto_off_below_battery_pct: Some(20),
-                auto_off_on_unplug: false,
-                watch_app_name: None,
-                watch_app_running: false,
-                last_auto_release_reason: None,
-                assertion_id: None,
-            };
+            return default_keep_awake_state();
         };
 
         let ext_now = power.battery.as_ref().map(|b| b.external_connected);
         let prev_ext = guard.was_external_connected;
         guard.was_external_connected = ext_now;
 
-        if let Some(ref target_app) = guard.config.watch_app_name {
-            let needle = target_app.to_ascii_lowercase();
-            guard.watch_app_running = running_apps
-                .iter()
-                .any(|a| a.to_ascii_lowercase().contains(&needle));
-        } else {
-            guard.watch_app_running = false;
+        if let Some(apps) = running_apps {
+            if let Some(ref target_app) = guard.config.watch_app_name {
+                let needle = target_app.to_ascii_lowercase();
+                let is_running = apps
+                    .iter()
+                    .any(|a| a.to_ascii_lowercase().contains(&needle));
+                guard.watch_app_running = is_running;
+                if !is_running {
+                    // App exited — re-arm so the next launch can trigger Keep-Awake again.
+                    guard.watch_suppressed_until_exit = false;
+                }
+            } else {
+                guard.watch_app_running = false;
+                guard.watch_suppressed_until_exit = false;
+            }
         }
 
-        // If watch-app trigger is configured, automatically activate when app is running (subject to battery safety).
-        if guard.assertion_id.is_none()
+        // Auto-activate when watched app is running AND wasn't manually/guardrail-released for this launch.
+        if running_apps.is_some()
+            && guard.assertion_id.is_none()
             && guard.config.watch_app_name.is_some()
             && guard.watch_app_running
+            && !guard.watch_suppressed_until_exit
             && !is_below_battery_floor(&guard.config, power)
         {
             let mut cfg = guard.config.clone();
             cfg.enabled = true;
-            let _ = apply_config_inner(&mut guard, cfg, power);
+            let _ = apply_config_inner(&mut guard, cfg, power, self.demo_mode);
         }
 
         if guard.assertion_id.is_some() {
             // 1. Timer expiration
             if let Some(exp) = guard.expires_at {
                 if Instant::now() >= exp {
-                    release_inner(&mut guard, Some("Keep-Awake timer finished".into()));
+                    release_inner(
+                        &mut guard,
+                        Some("Keep-Awake timer finished".into()),
+                        self.demo_mode,
+                    );
                     guard.config.enabled = false;
+                    if guard.config.watch_app_name.is_some() {
+                        guard.watch_suppressed_until_exit = true;
+                    }
                 }
             }
 
@@ -129,8 +160,12 @@ impl KeepAwakeManager {
                 release_inner(
                     &mut guard,
                     Some(format!("Auto-released: battery dropped below {floor}%")),
+                    self.demo_mode,
                 );
                 guard.config.enabled = false;
+                if guard.config.watch_app_name.is_some() {
+                    guard.watch_suppressed_until_exit = true;
+                }
             }
 
             // 3. Auto-release on AC unplug
@@ -142,19 +177,25 @@ impl KeepAwakeManager {
                 release_inner(
                     &mut guard,
                     Some("Auto-released: MacBook unplugged from AC".into()),
+                    self.demo_mode,
                 );
                 guard.config.enabled = false;
+                if guard.config.watch_app_name.is_some() {
+                    guard.watch_suppressed_until_exit = true;
+                }
             }
 
-            // 4. Watch-app exited
+            // 4. Watched app genuinely exited (ONLY when running_apps was actually checked!)
             if guard.assertion_id.is_some()
+                && running_apps.is_some()
                 && guard.config.watch_app_name.is_some()
                 && !guard.watch_app_running
             {
                 let name = guard.config.watch_app_name.clone().unwrap_or_default();
                 release_inner(
                     &mut guard,
-                    Some(format!("Auto-released: {name} is no longer running")),
+                    Some(format!("Auto-released: {name} exited")),
+                    self.demo_mode,
                 );
                 guard.config.enabled = false;
             }
@@ -163,20 +204,16 @@ impl KeepAwakeManager {
         build_state(&guard)
     }
 
+    pub fn has_watch_app(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|g| g.config.watch_app_name.is_some())
+            .unwrap_or(false)
+    }
+
     pub fn state(&self) -> KeepAwakeState {
         let Ok(guard) = self.inner.lock() else {
-            return KeepAwakeState {
-                active: false,
-                mode: "display".into(),
-                remaining_secs: None,
-                started_at_ms: None,
-                auto_off_below_battery_pct: Some(20),
-                auto_off_on_unplug: false,
-                watch_app_name: None,
-                watch_app_running: false,
-                last_auto_release_reason: None,
-                assertion_id: None,
-            };
+            return default_keep_awake_state();
         };
         build_state(&guard)
     }
@@ -185,8 +222,23 @@ impl KeepAwakeManager {
 impl Drop for KeepAwakeManager {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.inner.lock() {
-            release_inner(&mut guard, None);
+            release_inner(&mut guard, None, self.demo_mode);
         }
+    }
+}
+
+fn default_keep_awake_state() -> KeepAwakeState {
+    KeepAwakeState {
+        active: false,
+        mode: "display".into(),
+        remaining_secs: None,
+        started_at_ms: None,
+        auto_off_below_battery_pct: Some(20),
+        auto_off_on_unplug: false,
+        watch_app_name: None,
+        watch_app_running: false,
+        last_auto_release_reason: None,
+        assertion_id: None,
     }
 }
 
@@ -204,9 +256,9 @@ fn apply_config_inner(
     guard: &mut KeepAwakeInner,
     config: KeepAwakeConfig,
     power: &PowerSnapshot,
+    demo_mode: bool,
 ) -> Result<KeepAwakeState, String> {
-    // Release any prior assertion before changing mode or disabling.
-    release_inner(guard, None);
+    release_inner(guard, None, demo_mode);
     guard.config = config.clone();
 
     if !config.enabled {
@@ -222,23 +274,30 @@ fn apply_config_inner(
         return Ok(build_state(guard));
     }
 
-    let assertion_type = if config.mode == "system" {
-        "PreventUserIdleSystemSleep"
+    let id = if demo_mode {
+        // Never create a real macOS IOPMAssertion in `--demo` mode!
+        999_001u32
     } else {
-        "PreventUserIdleDisplaySleep"
-    };
+        let assertion_type = if config.mode == "system" {
+            "PreventUserIdleSystemSleep"
+        } else {
+            "PreventUserIdleDisplaySleep"
+        };
 
-    let label = match config.duration_mins {
-        Some(m) => format!("{WATTLOG_ASSERTION_TAG} ({} · {m}m)", config.mode),
-        None => format!("{WATTLOG_ASSERTION_TAG} ({})", config.mode),
-    };
+        let label = match config.duration_mins {
+            Some(m) => format!("{WATTLOG_ASSERTION_TAG} ({} · {m}m)", config.mode),
+            None => format!("{WATTLOG_ASSERTION_TAG} ({})", config.mode),
+        };
 
-    #[cfg(target_os = "macos")]
-    let id = macos_iopm::create_assertion(assertion_type, &label)?;
-    #[cfg(not(target_os = "macos"))]
-    let id = {
-        let _ = (assertion_type, label);
-        1u32
+        #[cfg(target_os = "macos")]
+        {
+            macos_iopm::create_assertion(assertion_type, &label)?
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (assertion_type, label);
+            1u32
+        }
     };
 
     let now = Instant::now();
@@ -253,12 +312,14 @@ fn apply_config_inner(
     Ok(build_state(guard))
 }
 
-fn release_inner(guard: &mut KeepAwakeInner, reason: Option<String>) {
+fn release_inner(guard: &mut KeepAwakeInner, reason: Option<String>, demo_mode: bool) {
     if let Some(id) = guard.assertion_id.take() {
-        #[cfg(target_os = "macos")]
-        let _ = macos_iopm::release_assertion(id);
-        #[cfg(not(target_os = "macos"))]
-        let _ = id;
+        if !demo_mode {
+            #[cfg(target_os = "macos")]
+            let _ = macos_iopm::release_assertion(id);
+            #[cfg(not(target_os = "macos"))]
+            let _ = id;
+        }
     }
     guard.started_at = None;
     guard.started_at_ms = None;
@@ -360,7 +421,6 @@ mod macos_iopm {
     }
 
     fn dict_duration_secs(d: &CFDictionary<CFString, CFType>) -> u64 {
-        // `AssertStartWhen` / `AssertionOnSince` is a CFDate (seconds since 2001-01-01).
         let now_cf = CFDate::now().abs_time();
         for key in ["AssertionOnSince", "AssertStartWhen"] {
             let k = CFString::new(key);
@@ -396,6 +456,7 @@ mod macos_iopm {
             let arr = unsafe { CFArray::<CFType>::wrap_under_get_rule(v_ptr as _) };
 
             let proc_path = process_path_for_pid(pid);
+            let start_time_secs = process_start_time_for_pid(pid).unwrap_or(0);
             let proc_name = proc_path
                 .as_deref()
                 .and_then(|p| std::path::Path::new(p).file_name())
@@ -417,7 +478,6 @@ mod macos_iopm {
                 };
 
                 let assert_type = dict_str(&d, "AssertType").unwrap_or_default();
-                // Filter to actual sleep-blocking assertion types (skip noisy UserIsActive tickles).
                 let blocks_display = matches!(
                     assert_type.as_str(),
                     "PreventUserIdleDisplaySleep"
@@ -461,6 +521,7 @@ mod macos_iopm {
 
                 out.push(SleepBlocker {
                     pid,
+                    start_time_secs,
                     process_name: proc_name.clone(),
                     app_name: app_name.clone(),
                     bundle_path: bundle_path.clone(),
@@ -477,7 +538,6 @@ mod macos_iopm {
             }
         }
 
-        // Sort: non-system critical first, then warning, then system; longer durations first.
         out.sort_by(|a, b| {
             let rank = |s: &str| match s {
                 "critical" => 0,
@@ -496,11 +556,53 @@ mod macos_iopm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::types::PowerState;
+
+    #[test]
+    fn watched_app_does_not_release_on_unchecked_tick_or_restart_after_manual_off() {
+        let mgr = KeepAwakeManager::new(true);
+        let power = PowerSnapshot {
+            system_watts: Some(8.0),
+            battery_watts: -8.0,
+            source_tier: "demo".into(),
+            state: PowerState::Discharging,
+            battery: None,
+            adapter: None,
+            components: None,
+        };
+
+        let cfg = KeepAwakeConfig {
+            enabled: false,
+            watch_app_name: Some("Xcode".into()),
+            ..Default::default()
+        };
+        mgr.apply_config(cfg, &power).unwrap();
+
+        // App running -> activates
+        let apps = vec!["Xcode".to_string()];
+        let st1 = mgr.enforce_guardrails(&power, Some(&apps));
+        assert!(st1.active);
+
+        // Lightweight tray tick with `None` -> MUST stay active!
+        let st2 = mgr.enforce_guardrails(&power, None);
+        assert!(st2.active);
+
+        // Manual toggle off while Xcode still running -> stays OFF even on next poll!
+        let st3 = mgr.toggle_quick(&power).unwrap();
+        assert!(!st3.active);
+        let st4 = mgr.enforce_guardrails(&power, Some(&apps));
+        assert!(!st4.active);
+
+        // Xcode exits, then relaunches -> re-arms and activates cleanly!
+        let empty: Vec<String> = vec![];
+        let _ = mgr.enforce_guardrails(&power, Some(&empty));
+        let st5 = mgr.enforce_guardrails(&power, Some(&apps));
+        assert!(st5.active);
+    }
 
     #[test]
     fn collects_native_sleep_blockers() {
         let blockers = collect_sleep_blockers();
-        // Should never panic and on a live awake Mac typically contains powerd or app assertions.
         assert!(blockers.len() < 10_000);
     }
 }
