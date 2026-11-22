@@ -1,0 +1,37 @@
+[package]
+name = "wattlog"
+version = "0.1.0"
+description = "Zero-root macOS Apple Silicon power, sleep-insomnia diagnostics, safe-by-default Keep-Awake, and grouped process monitor"
+authors = ["Wattlog"]
+edition = "2021"
+
+[lib]
+name = "wattlog_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "wattlog"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+dirs = "6"
+libc = "0.2"
+plist = "1.7"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+macmon = { version = "0.10", default-features = false }
+libproc = "0.14"
+mach2 = "0.4"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+tauri-nspanel = "2.1"
