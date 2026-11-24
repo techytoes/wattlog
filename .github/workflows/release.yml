@@ -1,0 +1,77 @@
+name: Release macOS (Apple Silicon)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend & run Rust unit tests
+        run: |
+          pnpm build
+          cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build Wattlog.app (aarch64-apple-darwin)
+        run: pnpm tauri build --target aarch64-apple-darwin --bundles app
+
+      - name: Ad-hoc sign & package release archive
+        run: |
+          APP_PATH="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Wattlog.app"
+          test -d "$APP_PATH"
+          codesign --force --deep --sign - "$APP_PATH"
+          codesign --verify --deep --strict "$APP_PATH"
+
+          mkdir -p release-artifacts
+          COPYFILE_DISABLE=1 tar -czf "release-artifacts/Wattlog-aarch64-apple-darwin.tar.gz" \
+            -C "$(dirname "$APP_PATH")" "Wattlog.app"
+          (cd release-artifacts && shasum -a 256 "Wattlog-aarch64-apple-darwin.tar.gz" > "Wattlog-aarch64-apple-darwin.tar.gz.sha256")
+          ls -lh release-artifacts
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/Wattlog-aarch64-apple-darwin.tar.gz
+            release-artifacts/Wattlog-aarch64-apple-darwin.tar.gz.sha256
+          body: |
+            ### Install (Apple Silicon macOS 13+)
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/techytoes/wattlog/main/install.sh | sh
+            ```
+
+            Installs `/Applications/Wattlog.app` (zero `sudo`, zero root daemon) and symlinks the `wattlog` CLI (`wattlog --plain`, `wattlog --json`, `wattlog --demo --plain`).
