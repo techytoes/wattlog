@@ -376,6 +376,16 @@ export async function forceKillProcess(
   });
 }
 
+export async function getWindowPinned(): Promise<boolean> {
+  if (!isTauriRuntime()) return false;
+  return invoke<boolean>("get_window_pinned");
+}
+
+export async function setWindowPinned(pinned: boolean): Promise<boolean> {
+  if (!isTauriRuntime()) return pinned;
+  return invoke<boolean>("set_window_pinned", { pinned });
+}
+
 export async function hideDashboard(): Promise<void> {
   if (!isTauriRuntime()) return;
   await invoke("hide_dashboard");

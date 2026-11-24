@@ -164,6 +164,29 @@ body,
   gap: 8px;
 }
 
+.pin-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--faint);
+  font-family: inherit;
+  font-size: 10px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: all 140ms ease;
+}
+
+.pin-btn:hover {
+  color: #cbd3e1;
+  border-color: rgba(255, 255, 255, 0.22);
+}
+
+.pin-btn.on {
+  color: var(--sky);
+  border-color: rgba(56, 189, 248, 0.42);
+  background: rgba(56, 189, 248, 0.1);
+}
+
 /* Keep-Awake Split Control with Breathing Amber Halo */
 .awake-ctrl {
   display: inline-flex;

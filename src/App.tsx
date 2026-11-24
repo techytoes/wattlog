@@ -2,9 +2,11 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import {
   fetchSnapshot,
   forceKillProcess,
+  getWindowPinned,
   hideDashboard,
   quitProcess,
   setKeepAwake,
+  setWindowPinned,
   toggleKeepAwake,
 } from "./api";
 import { MiniSparkline } from "./components/MiniSparkline";
@@ -27,6 +29,7 @@ export function App() {
   const [view, setView] = useState<TopView>("live");
   const [metric, setMetric] = useState<LiveMetricMode>("power");
   const [awakeDrawerOpen, setAwakeDrawerOpen] = useState(false);
+  const [pinned, setPinned] = useState(false);
   // Track selection by stable app group ID (never row index!) so 1.5s re-sorting never shifts targets.
   const [selectedAppId, setSelectedAppId] = useState<string | null>(null);
   const [expandedAppId, setExpandedAppId] = useState<string | null>(null);
@@ -105,6 +108,10 @@ export function App() {
     },
     [showToast],
   );
+
+  useEffect(() => {
+    void getWindowPinned().then(setPinned).catch(() => {});
+  }, []);
 
   // Live 1.5s polling on `live` (skipping `pmset -g log`); slow 10s polling on `sleep`.
   useEffect(() => {
@@ -244,6 +251,12 @@ export function App() {
     },
     [confirmKillPid, refresh, showToast],
   );
+
+  const handleTogglePin = useCallback(async () => {
+    const next = await setWindowPinned(!pinned);
+    setPinned(next);
+    showToast(next ? "window pinned (stays open)" : "popover mode (click outside hides)");
+  }, [pinned, showToast]);
 
   const handleCopyFix = useCallback(
     async (id: string, cmd: string) => {
@@ -661,6 +674,14 @@ export function App() {
         </div>
 
         <div className="tb-right">
+          <button
+            className={`pin-btn ${pinned ? "on" : ""}`}
+            onClick={handleTogglePin}
+            title={pinned ? "Pinned open (click to return to click-outside popover mode)" : "Pin window open"}
+            aria-pressed={pinned}
+          >
+            {pinned ? "pinned" : "pin"}
+          </button>
           <div className={`awake-ctrl ${keepAwake.active ? "on" : ""}`}>
             <button
               className="awake-btn"
